@@ -22,4 +22,15 @@
 #define IDM_MIC_OFF         40020
 #define IDM_MIC_DEFAULT     40021
 #define IDM_MIC_GAIN_BASE   40030  // + index into the gain steps
+#define IDM_SCENE_BASE      40040  // + scene index (0 Intro, 1 Screen, 2 Break, 3 Outro)
+#define IDM_SCENE_EDIT      40050
+#define IDM_SCENE_FRAMED    40051
+#define IDM_CANVAS_BASE     40055  // + 0 1080p, 1 1440p, 2 2160p
+#define IDM_BG_COLORS       40060
+#define IDM_BG_BLUR         40061
+#define IDM_BG_IMAGE        40062  // use the picture already chosen
+#define IDM_BG_PICK         40063  // choose a picture…
+
+#define IDD_SCENES          102
+#define IDC_SCENE_TEXT0     1010   // .. IDC_SCENE_TEXT0 + 5
 #define IDM_MIC_DEV_BASE    40100  // + index into the device list (up to 99)

@@ -14,3 +14,22 @@ BEGIN
     DEFPUSHBUTTON   "Save", IDOK, 140, 62, 52, 16
     PUSHBUTTON      "Cancel", IDCANCEL, 196, 62, 52, 16
 END
+
+IDD_SCENES DIALOGEX 0, 0, 300, 214
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Scene text"
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT           "Titles for the title cards. Leave a subtitle empty to hide it.", -1, 12, 10, 276, 12
+    LTEXT           "1  Intro", -1, 12, 30, 276, 10
+    EDITTEXT        IDC_SCENE_TEXT0, 12, 42, 276, 14, ES_AUTOHSCROLL
+    EDITTEXT        1011, 12, 59, 276, 14, ES_AUTOHSCROLL
+    LTEXT           "3  Break", -1, 12, 82, 276, 10
+    EDITTEXT        1012, 12, 94, 276, 14, ES_AUTOHSCROLL
+    EDITTEXT        1013, 12, 111, 276, 14, ES_AUTOHSCROLL
+    LTEXT           "4  Outro", -1, 12, 134, 276, 10
+    EDITTEXT        1014, 12, 146, 276, 14, ES_AUTOHSCROLL
+    EDITTEXT        1015, 12, 163, 276, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "Save", IDOK, 180, 190, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 236, 190, 52, 16
+END

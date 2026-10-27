@@ -144,6 +144,18 @@ Settings load_settings() {
             s.mic_enabled = (val == "1" || val == "true");
         } else if (key == "MicDevice") {
             s.mic_device = val;
+        } else if (key == "CanvasHeight") {
+            int v = atoi(val.c_str());
+            s.canvas_h = (v == 1080 || v == 1440 || v == 2160) ? v : s.canvas_h;
+        } else if (key == "Framed") {
+            s.framed = (val == "1" || val == "true");
+        } else if (key == "Background") {
+            int v = atoi(val.c_str());
+            s.background = (v >= 0 && v <= 2) ? v : 0;
+        } else if (key == "BackgroundImage") {
+            s.background_image = val;
+        } else if (key.size() == 10 && key.compare(0, 9, "SceneText") == 0 && key[9] >= '0' && key[9] <= '5') {
+            s.scene_text[key[9] - '0'] = val;
         } else if (key == "MicGain") {
             int g = atoi(val.c_str());
             s.mic_gain_pct = g > 0 && g <= 400 ? g : s.mic_gain_pct;
@@ -170,6 +182,13 @@ void save_settings(const Settings &s) {
     out << "MicEnabled=" << (s.mic_enabled ? 1 : 0) << "\n";
     out << "MicDevice=" << s.mic_device << "\n";
     out << "MicGain=" << s.mic_gain_pct << "\n";
+    out << "CanvasHeight=" << s.canvas_h << "\n";
+    out << "Framed=" << (s.framed ? 1 : 0) << "\n";
+    out << "Background=" << s.background << "\n";
+    out << "BackgroundImage=" << s.background_image << "\n";
+    for (int i = 0; i < 6; ++i) {
+        out << "SceneText" << i << "=" << s.scene_text[i] << "\n";
+    }
     out << "Window=" << s.win_x << "," << s.win_y << "," << s.win_w << "," << s.win_h << "\n";
 }
 

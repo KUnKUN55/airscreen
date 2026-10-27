@@ -1,3 +1,4 @@
+#include <winsock2.h> // before anything pulls in windows.h, for the adapter lookup below
 #include "receiver.h"
 #include "settings.h"
 #include "ui.h"
@@ -8,11 +9,13 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <iphlpapi.h>
 #include <windowsx.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <objbase.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <dbghelp.h>
 #include <timeapi.h>
@@ -23,6 +26,8 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "dbghelp.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 namespace {
 
@@ -61,11 +66,14 @@ struct App {
     LONG windowed_style = 0;
     LONG windowed_ex = 0;
     RECT windowed_rc = {};
-    std::wstring overlay_status = L"Waiting for iPhone";
+    std::wstring overlay_status = L"Ready to connect";
     std::wstring overlay_pin;
     std::wstring overlay_detail;
     bool connected = false;
     bool recording = false;
+    int scene = 1;          // studio scene on screen (0 Intro, 1 Screen, 2 Break, 3 Outro)
+    int scene_hot = -1;     // scene bar segment under the mouse
+    HWND scenes_hwnd = nullptr;
     std::vector<airscreen::MicCapture::Device> mics; // as listed when the menu last opened
     HICON icon = nullptr;
     HICON icon_sm = nullptr;
@@ -181,7 +189,7 @@ void toggle_recording(App *app) {
     swprintf_s(name, L"\\AirScreen_%04d-%02d-%02d_%02d-%02d-%02d.mp4", st.wYear, st.wMonth, st.wDay, st.wHour,
                st.wMinute, st.wSecond);
     rec.start(recordings_dir() + name);
-    app->receiver.video().prime_recorder(); // start from what's on screen now, even if the phone is idle
+    app->receiver.video().request_render(); // first frame now, even if the phone's screen is still
     app->recording = true;
     SetTimer(app->hwnd, kTimerRec, 500, nullptr);
     update_title(app);
@@ -265,6 +273,16 @@ void layout_chrome(App *app) {
         HRGN rgn = CreateRoundRectRgn(0, 0, size + 1, size + 1, size, size);
         SetWindowRgn(app->settings_hwnd, rgn, TRUE);
     }
+    if (app->scenes_hwnd) {
+        // Scene bar: bottom centre, a pill of four segments.
+        int bw = MulDiv(4 * 104 + 8, dpi, 96);
+        int bh = MulDiv(44, dpi, 96);
+        int bx = (cw - bw) / 2;
+        int by = ch - margin * 2 - bh;
+        SetWindowPos(app->scenes_hwnd, HWND_TOP, bx, by, bw, bh, SWP_NOACTIVATE);
+        HRGN rgn = CreateRoundRectRgn(0, 0, bw + 1, bh + 1, bh, bh);
+        SetWindowRgn(app->scenes_hwnd, rgn, TRUE);
+    }
 }
 
 void show_settings_button(App *app, bool show) {
@@ -275,6 +293,13 @@ void show_settings_button(App *app, bool show) {
     if (show) {
         SetWindowPos(app->settings_hwnd, HWND_TOP, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    // The scene bar comes and goes with the gear; it sits over the window only, never in a recording.
+    if (app->scenes_hwnd) {
+        ShowWindow(app->scenes_hwnd, show ? SW_SHOWNA : SW_HIDE);
+        if (show) {
+            SetWindowPos(app->scenes_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
 }
 
@@ -353,7 +378,8 @@ void return_to_menu(App *app) {
     set_boost(false);
     app->connected = false;
     app->mirroring = false;
-    app->overlay_status = L"Waiting for iPhone";
+    app->scene = 1; // the pipeline resets to Screen when the session ends
+    app->overlay_status = L"Ready to connect";
     app->overlay_pin.clear();
     if (app->video_hwnd) {
         ShowWindow(app->video_hwnd, SW_HIDE);
@@ -413,6 +439,148 @@ void do_rename(App *app) {
     }
 }
 
+const wchar_t *const kSceneNames[4] = {L"Intro", L"Screen", L"Break", L"Outro"};
+
+// Pushes canvas size, framing and the title-card text to the studio.
+void apply_studio(App *app) {
+    std::vector<std::wstring> texts;
+    for (int s = 0; s < 4; ++s) {
+        // Settings keep (title, subtitle) for the three title cards; the Screen scene has none.
+        int i = s == 0 ? 0 : s == 2 ? 2 : s == 3 ? 4 : -1;
+        texts.push_back(i < 0 ? L"" : app->utf16(app->settings.scene_text[i]));
+        texts.push_back(i < 0 ? L"" : app->utf16(app->settings.scene_text[i + 1]));
+    }
+    auto &video = app->receiver.video();
+    video.set_framed(app->settings.framed);
+    video.set_studio(app->settings.canvas_h, texts);
+    video.set_background(app->settings.background, app->utf16(app->settings.background_image));
+}
+
+// Asks for a picture, keeps a copy beside the settings (so moving or deleting the original doesn't break the
+// studio), and makes it the background.
+void pick_background(App *app) {
+    wchar_t file[MAX_PATH] = {};
+    OPENFILENAMEW ofn = {sizeof(ofn)};
+    ofn.hwndOwner = app->hwnd;
+    ofn.lpstrFilter = L"Pictures (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Choose a background picture";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) {
+        return;
+    }
+    std::wstring src = file;
+    size_t dot = src.find_last_of(L'.');
+    std::wstring copy = airscreen::app_data_dir() + L"\\background" + (dot == std::wstring::npos ? L"" : src.substr(dot));
+    if (_wcsicmp(src.c_str(), copy.c_str()) != 0 && !CopyFileW(src.c_str(), copy.c_str(), FALSE)) {
+        copy = src; // couldn't copy; use it where it is
+    }
+    if (!app->receiver.video().set_background(2, copy)) {
+        MessageBoxW(app->hwnd, L"That picture couldn't be opened. Try a PNG or JPEG.", L"AirScreen",
+                    MB_OK | MB_ICONWARNING);
+        app->receiver.video().set_background(app->settings.background, app->utf16(app->settings.background_image));
+        return;
+    }
+    int n = WideCharToMultiByte(CP_UTF8, 0, copy.c_str(), (int) copy.size(), nullptr, 0, nullptr, nullptr);
+    std::string utf8(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, copy.c_str(), (int) copy.size(), utf8.data(), n, nullptr, nullptr);
+    app->settings.background_image = utf8;
+    app->settings.background = 2;
+    airscreen::save_settings(app->settings);
+}
+
+void set_background_mode(App *app, int mode) {
+    app->settings.background = mode;
+    airscreen::save_settings(app->settings);
+    app->receiver.video().set_background(mode, app->utf16(app->settings.background_image));
+}
+
+void select_scene(App *app, int scene) {
+    if (scene < 0 || scene > 3 || !app->mirroring) {
+        return;
+    }
+    app->scene = scene;
+    app->receiver.video().set_scene(scene);
+    if (app->scenes_hwnd) {
+        InvalidateRect(app->scenes_hwnd, nullptr, FALSE);
+    }
+    note_activity(app);
+}
+
+INT_PTR CALLBACK scenes_dlg(HWND h, UINT msg, WPARAM w, LPARAM l) {
+    auto *app = (App *) GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (msg) {
+    case WM_INITDIALOG:
+        app = (App *) l;
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR) app);
+        for (int i = 0; i < 6; ++i) {
+            SetDlgItemTextW(h, IDC_SCENE_TEXT0 + i, app->utf16(app->settings.scene_text[i]).c_str());
+            SendDlgItemMessageW(h, IDC_SCENE_TEXT0 + i, EM_LIMITTEXT, 120, 0);
+        }
+        return TRUE;
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK) {
+            for (int i = 0; i < 6; ++i) {
+                wchar_t buf[128] = {};
+                GetDlgItemTextW(h, IDC_SCENE_TEXT0 + i, buf, 128);
+                int n = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+                std::string s(n > 0 ? n - 1 : 0, 0);
+                WideCharToMultiByte(CP_UTF8, 0, buf, -1, s.data(), n, nullptr, nullptr);
+                app->settings.scene_text[i] = s;
+            }
+            EndDialog(h, IDOK);
+            return TRUE;
+        }
+        if (LOWORD(w) == IDCANCEL) {
+            EndDialog(h, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    }
+    return FALSE;
+}
+
+void edit_scene_text(App *app) {
+    if (DialogBoxParamW(app->inst, MAKEINTRESOURCEW(IDD_SCENES), app->hwnd, scenes_dlg, (LPARAM) app) == IDOK) {
+        airscreen::save_settings(app->settings);
+        apply_studio(app);
+    }
+}
+
+HMENU build_scene_menu(App *app) {
+    HMENU m = CreatePopupMenu();
+    for (int i = 0; i < 4; ++i) {
+        wchar_t label[48];
+        swprintf_s(label, L"%s\t%d", kSceneNames[i], i + 1);
+        AppendMenuW(m, MF_STRING | (app->mirroring ? 0 : MF_GRAYED) | (app->scene == i ? MF_CHECKED : 0),
+                    IDM_SCENE_BASE + i, label);
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_SCENE_EDIT, L"Edit title cards…");
+    HMENU bg = CreatePopupMenu();
+    const auto &s = app->settings;
+    AppendMenuW(bg, MF_STRING | (s.background == 0 ? MF_CHECKED : 0), IDM_BG_COLORS, L"Studio colours");
+    AppendMenuW(bg, MF_STRING | (s.background == 1 ? MF_CHECKED : 0), IDM_BG_BLUR, L"Blurred screen");
+    AppendMenuW(bg, MF_STRING | (s.background == 2 ? MF_CHECKED : 0) | (s.background_image.empty() ? MF_GRAYED : 0),
+                IDM_BG_IMAGE, L"My picture");
+    AppendMenuW(bg, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(bg, MF_STRING, IDM_BG_PICK, L"Choose a picture…");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR) bg, L"Background");
+    AppendMenuW(m, MF_STRING | (s.framed ? MF_CHECKED : 0), IDM_SCENE_FRAMED,
+                L"Screen: rounded corners and shadow");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    const int sizes[3] = {1080, 1440, 2160};
+    const wchar_t *names[3] = {L"Canvas 1080p (smaller files)", L"Canvas 1440p", L"Canvas 4K (sharpest)"};
+    for (int i = 0; i < 3; ++i) {
+        // A different canvas size mid-clip would split the file; change it between recordings.
+        AppendMenuW(m, MF_STRING | (app->settings.canvas_h == sizes[i] ? MF_CHECKED : 0) |
+                           (app->recording ? MF_GRAYED : 0),
+                    IDM_CANVAS_BASE + i, names[i]);
+    }
+    return m;
+}
+
 void popup_settings_menu(App *app, POINT screen_pt, bool tray) {
     HMENU m = CreatePopupMenu();
     if (tray) {
@@ -420,6 +588,7 @@ void popup_settings_menu(App *app, POINT screen_pt, bool tray) {
     }
     AppendMenuW(m, MF_STRING | (app->mirroring || app->recording ? 0 : MF_GRAYED), IDM_REC_TOGGLE,
                 app->recording ? L"Stop recording\tCtrl+R" : L"Record clip\tCtrl+R");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR) build_scene_menu(app), L"Scenes");
     AppendMenuW(m, MF_POPUP, (UINT_PTR) build_mic_menu(app),
                 app->settings.mic_enabled ? L"Microphone in clips (on)\tCtrl+M" : L"Microphone in clips (off)\tCtrl+M");
     AppendMenuW(m, MF_STRING, IDM_REC_FOLDER, L"Open recordings folder");
@@ -462,6 +631,34 @@ void show_corner_menu(App *app) {
     popup_settings_menu(app, pt, false);
 }
 
+// "This PC  192.168.1.20  ·  Wi-Fi": the address of the adapter that reaches the router, so when the iPad
+// can't see the PC it's easy to check both are on the same network.
+std::wstring network_hint() {
+    ULONG size = 16 * 1024;
+    std::vector<BYTE> buf(size);
+    auto *list = (IP_ADAPTER_ADDRESSES *) buf.data();
+    ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    if (GetAdaptersAddresses(AF_INET, flags, nullptr, list, &size) == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(size);
+        list = (IP_ADAPTER_ADDRESSES *) buf.data();
+    }
+    if (GetAdaptersAddresses(AF_INET, flags, nullptr, list, &size) != NO_ERROR) {
+        return {};
+    }
+    for (auto *a = list; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || !a->FirstGatewayAddress ||
+            !a->FirstUnicastAddress) {
+            continue;
+        }
+        auto *sin = (sockaddr_in *) a->FirstUnicastAddress->Address.lpSockaddr;
+        wchar_t ip[32];
+        const BYTE *b = (const BYTE *) &sin->sin_addr;
+        swprintf_s(ip, L"%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        return std::wstring(L"This PC  ") + ip + L"   ·   " + a->FriendlyName;
+    }
+    return {};
+}
+
 void paint_idle(App *app, HDC hdc, RECT rc) {
     airscreen::UiView v;
     v.name = app->utf16(app->settings.name);
@@ -474,6 +671,8 @@ void paint_idle(App *app, HDC hdc, RECT rc) {
     v.dark = app->settings.dark_mode;
     v.failed = app->start_failed;
     v.inset_right = 0;
+    static std::wstring net = network_hint(); // adapters rarely change while the window is up
+    v.detail = net;
     app->shell.paint(app->hwnd, hdc, rc, v, app->hover);
 }
 
@@ -511,6 +710,22 @@ void handle_tray_cmd(App *app, UINT id) {
         break;
     case IDM_REC_TOGGLE:
         toggle_recording(app);
+        break;
+    case IDM_SCENE_EDIT:
+        edit_scene_text(app);
+        break;
+    case IDM_BG_COLORS:
+    case IDM_BG_BLUR:
+    case IDM_BG_IMAGE:
+        set_background_mode(app, (int) (id - IDM_BG_COLORS));
+        break;
+    case IDM_BG_PICK:
+        pick_background(app);
+        break;
+    case IDM_SCENE_FRAMED:
+        app->settings.framed = !app->settings.framed;
+        airscreen::save_settings(app->settings);
+        app->receiver.video().set_framed(app->settings.framed);
         break;
     case IDM_MIC_OFF:
     case IDM_MIC_DEFAULT:
@@ -557,7 +772,14 @@ void handle_tray_cmd(App *app, UINT id) {
         DestroyWindow(app->hwnd);
         return;
     default:
-        if (id >= IDM_MIC_DEV_BASE && id < IDM_MIC_DEV_BASE + app->mics.size()) {
+        if (id >= IDM_SCENE_BASE && id < IDM_SCENE_BASE + 4) {
+            select_scene(app, (int) (id - IDM_SCENE_BASE));
+        } else if (id >= IDM_CANVAS_BASE && id < IDM_CANVAS_BASE + 3) {
+            const int sizes[3] = {1080, 1440, 2160};
+            app->settings.canvas_h = sizes[id - IDM_CANVAS_BASE];
+            airscreen::save_settings(app->settings);
+            apply_studio(app);
+        } else if (id >= IDM_MIC_DEV_BASE && id < IDM_MIC_DEV_BASE + app->mics.size()) {
             const std::wstring &dev = app->mics[id - IDM_MIC_DEV_BASE].id;
             int n = WideCharToMultiByte(CP_UTF8, 0, dev.c_str(), (int) dev.size(), nullptr, 0, nullptr, nullptr);
             std::string utf8(n, 0);
@@ -646,6 +868,107 @@ void paint_gear(HWND hwnd, HDC hdc, bool hot) {
     SelectObject(mem, old_bmp);
     DeleteObject(bmp);
     DeleteDC(mem);
+}
+
+int scene_segment(HWND hwnd, int x) {
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    int pad = MulDiv(4, window_dpi(hwnd), 96);
+    int seg = (rc.right - pad * 2) / 4;
+    if (seg <= 0 || x < pad || x >= pad + seg * 4) {
+        return -1;
+    }
+    return (x - pad) / seg;
+}
+
+void paint_scenes(HWND hwnd, HDC hdc, int current, int hot) {
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    int w = rc.right, h = rc.bottom;
+    UINT dpi = window_dpi(hwnd);
+    HDC mem = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
+    HGDIOBJ old_bmp = SelectObject(mem, bmp);
+    HBRUSH plate = CreateSolidBrush(RGB(30, 30, 34));
+    FillRect(mem, &rc, plate);
+    DeleteObject(plate);
+
+    int pad = MulDiv(4, dpi, 96);
+    int seg = (w - pad * 2) / 4;
+    HFONT font = CreateFontW(-MulDiv(13, dpi, 96), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HGDIOBJ old_font = SelectObject(mem, font);
+    SetBkMode(mem, TRANSPARENT);
+    for (int i = 0; i < 4; ++i) {
+        RECT s = {pad + seg * i, pad, pad + seg * (i + 1), h - pad};
+        bool on = i == current;
+        if (on || i == hot) {
+            // The live scene is a white pill; hover is a faint one.
+            HBRUSH b = CreateSolidBrush(on ? RGB(245, 245, 247) : RGB(58, 58, 64));
+            HPEN none = (HPEN) GetStockObject(NULL_PEN);
+            HGDIOBJ ob = SelectObject(mem, b), op = SelectObject(mem, none);
+            int r = s.bottom - s.top;
+            RoundRect(mem, s.left, s.top, s.right + 1, s.bottom + 1, r, r);
+            SelectObject(mem, ob);
+            SelectObject(mem, op);
+            DeleteObject(b);
+        }
+        wchar_t label[32];
+        swprintf_s(label, L"%d   %s", i + 1, kSceneNames[i]);
+        SetTextColor(mem, on ? RGB(24, 24, 28) : RGB(225, 225, 230));
+        DrawTextW(mem, label, -1, &s, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(mem, old_font);
+    DeleteObject(font);
+    BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old_bmp);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+}
+
+LRESULT CALLBACK scenes_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    App *app = g_app;
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        paint_scenes(hwnd, hdc, app ? app->scene : 1, app ? app->scene_hot : -1);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
+        TrackMouseEvent(&tme);
+        int hot = scene_segment(hwnd, GET_X_LPARAM(lparam));
+        if (app && hot != app->scene_hot) {
+            app->scene_hot = hot;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (app) {
+            note_activity(app);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (app) {
+            app->scene_hot = -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (app) {
+            select_scene(app, scene_segment(hwnd, GET_X_LPARAM(lparam)));
+        }
+        return 0;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(nullptr, IDC_HAND));
+        return TRUE;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
 LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -809,7 +1132,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             KillTimer(hwnd, kTimerDisconnect);
             return_to_menu(app);
         } else if (wparam == kTimerDrift && !app->mirroring) {
-            InvalidateRect(hwnd, nullptr, FALSE);
+            // Full rate only while you're looking at it: a background window ticks at 5 fps, a minimized
+            // or hidden one not at all.
+            static unsigned tick = 0;
+            bool front = GetForegroundWindow() == hwnd;
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && (front || ++tick % 4 == 0)) {
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         } else if (wparam == kTimerRec) {
             if (app->recording && !app->receiver.recorder().active()) {
                 app->receiver.recorder().stop();
@@ -849,6 +1178,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             toggle_recording(app);
         } else if (wparam == 'M' && (GetKeyState(VK_CONTROL) & 0x8000)) {
             toggle_mic(app);
+        } else if (wparam >= '1' && wparam <= '4') {
+            select_scene(app, (int) (wparam - '1'));
+        } else if (wparam >= VK_NUMPAD1 && wparam <= VK_NUMPAD4) {
+            select_scene(app, (int) (wparam - VK_NUMPAD1));
         } else if (wparam == VK_ESCAPE && app->fullscreen) {
             set_fullscreen(app, false);
         }
@@ -1065,6 +1398,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
         airscreen::append_log("RegisterClassEx gear failed");
         return 1;
     }
+    WNDCLASSEXW sc = gc;
+    sc.lpfnWndProc = scenes_proc;
+    sc.lpszClassName = L"AirScreenScenes";
+    RegisterClassExW(&sc);
 
     app.hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"AirScreen",
                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 720,
@@ -1078,6 +1415,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
                                      nullptr, inst, nullptr);
     app.settings_hwnd = CreateWindowExW(0, L"AirScreenGear", L"Settings", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 40, 40,
                                         app.hwnd, (HMENU)(INT_PTR) IDC_SETTINGS, inst, nullptr);
+    app.scenes_hwnd = CreateWindowExW(0, L"AirScreenScenes", L"Scenes", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 100, 40,
+                                      app.hwnd, nullptr, inst, nullptr);
     RECT saved = {app.settings.win_x, app.settings.win_y, app.settings.win_x + app.settings.win_w,
                   app.settings.win_y + app.settings.win_h};
     if (app.settings.win_w > 0 && app.settings.win_h > 0 && MonitorFromRect(&saved, MONITOR_DEFAULTTONULL)) {
@@ -1109,7 +1448,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
     Shell_NotifyIconW(NIM_ADD, &app.nid);
     app.nid.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &app.nid);
-    SetTimer(app.hwnd, kTimerDrift, 100, nullptr); // the field drifts over minutes; 10 fps is plenty
+    SetTimer(app.hwnd, kTimerDrift, 50, nullptr); // 20 fps: enough for the slow AirPlay rings and drift
 
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 #ifdef PROCESS_POWER_THROTTLING_CURRENT_VERSION
@@ -1120,8 +1459,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
     SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pt, sizeof(pt));
 #endif
 
+    // Let the first paint land before the receiver starts, but bounded: the idle animation keeps the queue
+    // from ever running dry, so draining it until empty would never get to starting AirPlay.
     MSG pump;
-    while (PeekMessageW(&pump, nullptr, 0, 0, PM_REMOVE)) {
+    ULONGLONG pump_until = GetTickCount64() + 250;
+    while (GetTickCount64() < pump_until && PeekMessageW(&pump, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&pump);
         DispatchMessageW(&pump);
     }
@@ -1138,9 +1480,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
                     L"Could not start the AirPlay receiver.\n\nAllow AirScreen through the firewall (tray menu) and check %APPDATA%\\AirScreen\\airscreen.log",
                     L"AirScreen", MB_OK | MB_ICONERROR);
     } else {
-        app.overlay_status = L"Waiting for iPhone";
+        app.overlay_status = L"Ready to connect";
         apply_video_fill(&app);
         apply_mic(&app);
+        apply_studio(&app);
         InvalidateRect(app.hwnd, nullptr, FALSE);
     }
 

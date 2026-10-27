@@ -1,5 +1,7 @@
 #pragma once
 
+#include "studio.h"
+
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <atomic>
@@ -36,9 +38,18 @@ public:
     // doesn't reach the screen. Off: show every frame the moment it decodes, for the lowest latency.
     void set_smooth(bool on) { smooth_.store(on); }
     void set_recorder(Recorder *rec);
-    // Hands the picture currently on screen to the recorder, so a clip starts at once even if the phone's
-    // screen is still (iOS only sends frames when something changes). False if nothing has been shown yet.
-    bool prime_recorder();
+
+    // Studio: what the window shows and clips record is a 16:9 canvas holding one scene (see Studio).
+    // `texts` holds title, subtitle for each scene in order; `canvas_h` is the canvas height (16:9).
+    void set_studio(int canvas_h, const std::vector<std::wstring> &texts);
+    void set_scene(int scene);
+    int scene();
+    void set_framed(bool framed);
+    // 0 studio colours, 1 blurred screen, 2 the picture at `image_path` (see Studio::Background). False if the
+    // picture couldn't be loaded; the studio then keeps its colours.
+    bool set_background(int mode, const std::wstring &image_path);
+    // Asks the render thread for a fresh frame (new picture, resize, scene change, recording start).
+    void request_render();
     void clear();
 
     int width() const { return width_.load(); }
@@ -69,7 +80,8 @@ private:
     void pace(const EncodedPacket &pkt);
     void start_worker();
     void stop_worker();
-    void present_nv12();
+    void render_loop();
+    void render_once();
     void upload_yuv420(const uint8_t *y, int y_stride, const uint8_t *u, const uint8_t *v, int uv_stride, int w, int h);
 
     HWND hwnd_ = nullptr;
@@ -126,8 +138,17 @@ private:
     std::mutex mu_;
     std::function<void()> first_frame_fn_;
     Recorder *recorder_ = nullptr; // guarded by mu_
-    int64_t last_pts_us_ = 0;      // sender time of the picture in nv12_; guarded by mu_
-    int64_t last_local_us_ = 0;    // local time it was decoded; guarded by mu_
+    Studio studio_;                // guarded by mu_
+    int bg_mode_ = 0;              // background choice and picture; set and read on the UI thread only
+    std::wstring bg_path_;
+    bool src_dirty_ = false;       // nv12_ holds a picture not yet converted for the studio; guarded by mu_
+
+    // The render thread composes and presents; decoding only fills nv12_ and wakes it.
+    std::mutex render_mu_;
+    std::condition_variable render_cv_;
+    bool render_dirty_ = false; // guarded by render_mu_
+    std::atomic<bool> render_run_{false};
+    std::thread render_;
 
     // Packets are never dropped one at a time: losing one corrupts every frame after it until the next
     // keyframe, which iOS rarely sends. A backlog is decoded in full and only its newest frame is shown.

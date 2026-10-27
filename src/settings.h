@@ -21,6 +21,13 @@ struct Settings {
     bool mic_enabled = false; // mix a microphone into recorded clips
     std::string mic_device;   // WASAPI endpoint id (UTF-8); empty = Windows default recording device
     int mic_gain_pct = 100;
+    // Studio: the 16:9 canvas the window shows and clips record.
+    int canvas_h = 1440;  // 1080, 1440 or 2160
+    bool framed = true;   // Screen scene: rounded picture with a shadow, rather than full size on black
+    int background = 0;   // 0 studio colours, 1 blurred screen, 2 your picture
+    std::string background_image; // copy of the chosen picture in %APPDATA%\AirScreen (UTF-8 path)
+    std::string scene_text[6] = {"เริ่มในอีกสักครู่", "", "พักสักครู่", "เดี๋ยวกลับมาต่อ", "ขอบคุณที่รับชม", ""};
+    // (title, subtitle) for Intro, Break and Outro, UTF-8
     int win_x = 0, win_y = 0, win_w = 0, win_h = 0; // 0 size = default placement
 };
 

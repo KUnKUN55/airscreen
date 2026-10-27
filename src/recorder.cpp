@@ -184,8 +184,9 @@ Recorder::~Recorder() {
     if (remux_.joinable()) {
         remux_.join(); // let the last clip finish turning into a plain MP4 before the app exits
     }
-    for (auto *t : pool_) {
-        t->Release();
+    for (auto &p : pool_) {
+        p.first->Release();
+        p.second->Release();
     }
     pool_.clear();
 }
@@ -202,9 +203,7 @@ bool Recorder::start(const std::wstring &path) {
         part_ = 1;
     }
     base_us_ = INT64_MIN;
-    last_video_us_ = 0;
-    offset_us_ = INT64_MIN;
-    win_start_ = 0;
+    last_video_us_ = 0; // offset_us_ carries over: note_clock() keeps it current whenever video flows
     base_local_us_ = 0;
     end_local_us_ = 0;
     dropped_ = 0;
@@ -290,11 +289,13 @@ std::wstring Recorder::part_path(int part) const {
     return p.substr(0, dot) + suffix + p.substr(dot);
 }
 
-ID3D11Texture2D *Recorder::take_staging(ID3D11Device *device, int w, int h) {
+// A pair of CPU-readable staging textures for one canvas frame: Y at full size, CbCr at half.
+bool Recorder::take_staging(ID3D11Device *device, int w, int h, Item &it) {
     std::lock_guard<std::mutex> lock(pool_mu_);
     if (w != pool_w_ || h != pool_h_) {
-        for (auto *t : pool_) {
-            t->Release();
+        for (auto &p : pool_) {
+            p.first->Release();
+            p.second->Release();
         }
         pool_.clear();
         pool_w_ = w;
@@ -302,101 +303,103 @@ ID3D11Texture2D *Recorder::take_staging(ID3D11Device *device, int w, int h) {
         pool_out_ = 0;
     }
     if (!pool_.empty()) {
-        ID3D11Texture2D *t = pool_.back();
+        it.staging = pool_.back().first;
+        it.staging_uv = pool_.back().second;
         pool_.pop_back();
         ++pool_out_;
-        return t;
+        return true;
     }
     if (pool_out_ >= kMaxStaging) {
-        return nullptr;
+        return false;
     }
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT) w;
     td.Height = (UINT) h;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_NV12;
+    td.Format = DXGI_FORMAT_R8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_STAGING;
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Texture2D *t = nullptr;
-    if (FAILED(device->CreateTexture2D(&td, nullptr, &t))) {
-        return nullptr;
+    ID3D11Texture2D *y = nullptr, *uv = nullptr;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &y))) {
+        return false;
     }
+    td.Width = (UINT) (w / 2);
+    td.Height = (UINT) (h / 2);
+    td.Format = DXGI_FORMAT_R8G8_UNORM;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &uv))) {
+        y->Release();
+        return false;
+    }
+    it.staging = y;
+    it.staging_uv = uv;
     ++pool_out_;
-    return t;
+    return true;
 }
 
-void Recorder::return_staging(ID3D11Texture2D *tex, int w, int h) {
-    if (!tex) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(pool_mu_);
-    if (w == pool_w_ && h == pool_h_) {
-        --pool_out_;
-        pool_.push_back(tex);
-    } else {
-        tex->Release();
-    }
-}
-
-void Recorder::release_item(Item &it) {
-    if (it.staging) {
-        return_staging(it.staging, it.w, it.h);
-        it.staging = nullptr;
-    }
-    if (it.sw_frame) {
-        av_frame_free((AVFrame **) &it.sw_frame);
-    }
-}
-
-void Recorder::on_video_frame(ID3D11Device *device, ID3D11DeviceContext *ctx, const void *frame_ptr, int w, int h) {
-    if (!active_.load() || !frame_ptr || w <= 0 || h <= 0) {
-        return;
-    }
-    auto *frame = (const AVFrame *) frame_ptr;
-    int64_t pts = frame->pts != AV_NOPTS_VALUE ? frame->pts : local_us();
-    if (frame->format == AV_PIX_FMT_D3D11) {
-        on_video_texture(device, ctx, (ID3D11Texture2D *) frame->data[0], (unsigned) (intptr_t) frame->data[1], w, h,
-                         pts);
-        return;
-    }
-    if (frame->format != AV_PIX_FMT_NV12 && frame->format != AV_PIX_FMT_YUV420P &&
-        frame->format != AV_PIX_FMT_YUVJ420P) {
-        return;
-    }
-    if (!video_slot_free()) {
-        return;
-    }
-    Item it;
-    it.video = true;
-    it.pts_us = pts;
-    it.w = w;
-    it.h = h;
-    it.sw_frame = av_frame_clone(frame);
-    if (it.sw_frame) {
-        push_video(std::move(it));
-    }
-}
-
-void Recorder::on_video_texture(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, unsigned index,
-                                int w, int h, int64_t pts_us) {
-    if (!active_.load() || !tex || w <= 0 || h <= 0 || !video_slot_free()) {
-        return;
-    }
-    Item it;
-    it.video = true;
-    it.pts_us = pts_us;
-    it.w = w;
-    it.h = h;
-    it.staging = take_staging(device, w, h);
+void Recorder::return_staging(Item &it) {
     if (!it.staging) {
         return;
     }
-    D3D11_BOX box = {0, 0, 0, (UINT) w, (UINT) h, 1};
-    ctx->CopySubresourceRegion(it.staging, 0, 0, 0, 0, tex, index, &box);
+    std::lock_guard<std::mutex> lock(pool_mu_);
+    if (it.w == pool_w_ && it.h == pool_h_) {
+        --pool_out_;
+        pool_.push_back({it.staging, it.staging_uv});
+    } else {
+        it.staging->Release();
+        it.staging_uv->Release();
+    }
+    it.staging = nullptr;
+    it.staging_uv = nullptr;
+}
+
+void Recorder::release_item(Item &it) {
+    return_staging(it);
+}
+
+void Recorder::on_canvas(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *y, ID3D11Texture2D *uv,
+                         int w, int h, int64_t local_time_us) {
+    if (!active_.load() || !y || !uv || w <= 0 || h <= 0 || !video_slot_free()) {
+        return;
+    }
+    Item it;
+    it.video = true;
+    it.pts_us = local_time_us;
+    it.w = w;
+    it.h = h;
+    if (!take_staging(device, w, h, it)) {
+        return;
+    }
+    // Queued on the GPU now, read back on the writer thread once it has landed.
+    ctx->CopyResource(it.staging, y);
+    ctx->CopyResource(it.staging_uv, uv);
     ctx_ = ctx;
-    push_video(std::move(it));
+    int64_t expect = INT64_MIN;
+    if (base_us_.compare_exchange_strong(expect, local_time_us)) {
+        base_local_us_ = local_time_us;
+    }
+    last_video_us_ = local_time_us;
+    {
+        std::lock_guard<std::mutex> lock(q_mu_);
+        ++queued_video_;
+        q_.push_back(std::move(it));
+    }
+    q_cv_.notify_one();
+}
+
+void Recorder::note_clock(int64_t sender_us, int64_t local_time_us) {
+    // Local clock minus sender clock from the least-delayed frame of the last few seconds: where the iPhone's
+    // audio timestamps land on the local timeline the clip is built on.
+    int64_t d = local_time_us - sender_us;
+    if (win_start_ == 0 || local_time_us - win_start_ >= kOffsetWindowUs) {
+        prev_min_ = win_start_ == 0 ? d : cur_min_;
+        cur_min_ = d;
+        win_start_ = local_time_us;
+    } else {
+        cur_min_ = (std::min)(cur_min_, d);
+    }
+    offset_us_ = (std::min)(cur_min_, prev_min_);
 }
 
 bool Recorder::video_slot_free() {
@@ -413,33 +416,6 @@ bool Recorder::video_slot_free() {
     return true;
 }
 
-void Recorder::push_video(Item &&it) {
-    int64_t pts = it.pts_us;
-    int64_t now = local_us();
-    int64_t expect = INT64_MIN;
-    if (base_us_.compare_exchange_strong(expect, pts)) {
-        base_local_us_ = now;
-    }
-    last_video_us_ = pts;
-    // Track local clock minus sender clock using the least-delayed frame of the last few seconds. The mic is
-    // timed on the local clock; this puts it on the same timeline as the video.
-    int64_t d = now - pts;
-    if (win_start_ == 0 || now - win_start_ >= kOffsetWindowUs) {
-        prev_min_ = win_start_ == 0 ? d : cur_min_;
-        cur_min_ = d;
-        win_start_ = now;
-    } else {
-        cur_min_ = (std::min)(cur_min_, d);
-    }
-    offset_us_ = (std::min)(cur_min_, prev_min_);
-    {
-        std::lock_guard<std::mutex> lock(q_mu_);
-        ++queued_video_;
-        q_.push_back(std::move(it));
-    }
-    q_cv_.notify_one();
-}
-
 void Recorder::on_audio_pcm(const int16_t *pcm, int frames, int channels, int rate, uint64_t ntp_ns) {
     if (!active_.load() || !pcm || frames <= 0 || channels <= 0 || rate <= 0) {
         return;
@@ -449,7 +425,8 @@ void Recorder::on_audio_pcm(const int16_t *pcm, int frames, int channels, int ra
     }
     Item it;
     it.video = false;
-    it.pts_us = ntp_ns ? (int64_t) (ntp_ns / 1000) : INT64_MIN;
+    int64_t off = offset_us_.load();
+    it.pts_us = ntp_ns && off != INT64_MIN ? (int64_t) (ntp_ns / 1000) + off : INT64_MIN; // onto the local clock
     it.channels = channels;
     it.rate = rate;
     it.pcm.assign(pcm, pcm + (size_t) frames * (size_t) channels);
@@ -464,14 +441,13 @@ void Recorder::on_audio_pcm(const int16_t *pcm, int frames, int channels, int ra
 }
 
 void Recorder::on_mic_pcm(const float *pcm, int frames, int64_t local_time_us) {
-    int64_t off = offset_us_.load();
-    if (!active_.load() || frames <= 0 || off == INT64_MIN) {
-        return; // nothing to line the mic up with until the first picture arrives
+    if (!active_.load() || frames <= 0) {
+        return;
     }
     float gain = mic_gain_.load();
     Item it;
     it.mic = true;
-    it.pts_us = local_time_us - off;
+    it.pts_us = local_time_us; // the clip's timeline is the local clock already
     it.fpcm.resize((size_t) frames * MicCapture::kChannels);
     for (size_t i = 0; i < it.fpcm.size(); ++i) {
         it.fpcm[i] = pcm[i] * gain;
@@ -617,40 +593,26 @@ bool Recorder::handle_video(Item &it) {
         return true;
     }
     bool ok = false;
-    if (it.staging && ctx_) {
-        D3D11_MAPPED_SUBRESOURCE map = {};
-        HRESULT hr;
-        // Poll instead of blocking inside Map, which would hold the device lock the decode thread needs.
-        while ((hr = ctx_->Map(it.staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &map)) ==
-               DXGI_ERROR_WAS_STILL_DRAWING) {
-            Sleep(1);
-        }
-        if (SUCCEEDED(hr)) {
-            const uint8_t *y = (const uint8_t *) map.pData;
-            copy_nv12(f, y, (int) map.RowPitch, y + (size_t) map.RowPitch * it.h, (int) map.RowPitch, it.w, it.h);
+    if (it.staging && it.staging_uv && ctx_) {
+        // Poll instead of blocking inside Map, which would hold the device lock the render thread needs.
+        auto map_read = [&](ID3D11Texture2D *t, D3D11_MAPPED_SUBRESOURCE &m) {
+            HRESULT hr;
+            while ((hr = ctx_->Map(t, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)) ==
+                   DXGI_ERROR_WAS_STILL_DRAWING) {
+                Sleep(1);
+            }
+            return SUCCEEDED(hr);
+        };
+        D3D11_MAPPED_SUBRESOURCE my = {}, muv = {};
+        if (map_read(it.staging, my)) {
+            if (map_read(it.staging_uv, muv)) {
+                copy_nv12(f, (const uint8_t *) my.pData, (int) my.RowPitch, (const uint8_t *) muv.pData,
+                          (int) muv.RowPitch, it.w, it.h);
+                ctx_->Unmap(it.staging_uv, 0);
+                ok = true;
+            }
             ctx_->Unmap(it.staging, 0);
-            ok = true;
         }
-    } else if (it.sw_frame) {
-        auto *src = (AVFrame *) it.sw_frame;
-        if (src->format == AV_PIX_FMT_NV12) {
-            copy_nv12(f, src->data[0], src->linesize[0], src->data[1], src->linesize[1], it.w, it.h);
-        } else {
-            for (int row = 0; row < it.h; ++row) {
-                memcpy(f->data[0] + (size_t) row * f->linesize[0], src->data[0] + (size_t) row * src->linesize[0],
-                       (size_t) it.w);
-            }
-            for (int row = 0; row < it.h / 2; ++row) {
-                uint8_t *dst = f->data[1] + (size_t) row * f->linesize[1];
-                const uint8_t *u = src->data[1] + (size_t) row * src->linesize[1];
-                const uint8_t *v = src->data[2] + (size_t) row * src->linesize[2];
-                for (int x = 0; x < it.w / 2; ++x) {
-                    dst[x * 2] = u[x];
-                    dst[x * 2 + 1] = v[x];
-                }
-            }
-        }
-        ok = true;
     }
     if (!ok) {
         av_frame_free(&f);
@@ -667,15 +629,14 @@ bool Recorder::handle_video(Item &it) {
 // file keeps growing (and stays crash-safe) under a narration, and editors don't see a frozen gap.
 bool Recorder::repeat_if_still() {
     Out &o = *out_;
-    int64_t off = offset_us_.load();
     int64_t now = local_us();
-    if (!o.last_frame || off == INT64_MIN || now - o.last_video_local < kRepeatUs) {
+    if (!o.last_frame || now - o.last_video_local < kRepeatUs) {
         return true;
     }
-    return encode_last_frame(now - off);
+    return encode_last_frame(now);
 }
 
-// Encodes the most recent picture at sender time `pts_us`.
+// Encodes the most recent picture at local time `pts_us`.
 bool Recorder::encode_last_frame(int64_t pts_us) {
     Out &o = *out_;
     if (!o.last_frame) {
@@ -737,18 +698,17 @@ void Recorder::mix_in(int src, const float *pcm, int frames, int64_t at, bool ti
     }
 }
 
-// Sample position up to which every source has had its chance to arrive: the sender's "now" less a grace
-// period, and never past where a source that is still delivering has got to. Without that second bound, a
-// clock estimate that runs ahead (the network got slower and stayed slow) would encode silence over audio
-// that was simply late.
+// Sample position up to which every source has had its chance to arrive: now less a grace period, and never
+// past where a source that is still delivering has got to. Without that second bound, iPhone audio placed by
+// a clock estimate that runs behind (the network got slower and stayed slow) would land on stretches already
+// encoded as silence.
 int64_t Recorder::watermark() const {
-    int64_t offset = offset_us_.load();
-    if (offset == INT64_MIN || !out_) {
+    if (!out_) {
         return 0;
     }
     const Out &o = *out_;
     int64_t now = local_us();
-    int64_t wm = (now - offset - o.part_base_us - kMixLatencyUs) * kAudioRate / 1000000;
+    int64_t wm = (now - o.part_base_us - kMixLatencyUs) * kAudioRate / 1000000;
     for (int s = 0; s < 2; ++s) {
         if (o.src_last_local[s] && now - o.src_last_local[s] < kSourceIdleUs && o.src_next[s] != INT64_MIN) {
             wm = (std::min)(wm, o.src_next[s]);

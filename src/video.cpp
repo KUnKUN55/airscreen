@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <chrono>
 
 #pragma comment(lib, "avrt.lib")
 
@@ -164,12 +165,21 @@ bool VideoPipeline::init(HWND hwnd) {
         if (!create_pipeline()) {
             return false;
         }
+        if (!studio_.init(device_, ctx_) || !studio_.set_canvas_size(2560, 1440)) {
+            append_log("studio init failed");
+            return false;
+        }
     }
     start_worker();
     return true;
 }
 
 void VideoPipeline::stop_worker() {
+    render_run_ = false;
+    render_cv_.notify_all();
+    if (render_.joinable()) {
+        render_.join();
+    }
     worker_run_ = false;
     q_cv_.notify_all();
     if (worker_.joinable()) {
@@ -185,12 +195,15 @@ void VideoPipeline::start_worker() {
     }
     worker_run_ = true;
     worker_ = std::thread([this] { decode_loop(); });
+    render_run_ = true;
+    render_ = std::thread([this] { render_loop(); });
 }
 
 void VideoPipeline::shutdown() {
     stop_worker();
     std::lock_guard<std::mutex> lock(mu_);
     decode_close();
+    studio_.shutdown();
     if (staging_) {
         staging_->Release();
         staging_ = nullptr;
@@ -288,6 +301,7 @@ void VideoPipeline::resize() {
         device_->CreateRenderTargetView(back, nullptr, &rtv_);
         back->Release();
     }
+    request_render();
 }
 
 void VideoPipeline::flush() {
@@ -308,6 +322,7 @@ void VideoPipeline::clear() {
     }
     std::lock_guard<std::mutex> lock(mu_);
     has_frame_ = false;
+    studio_.reset();
     if (rtv_ && ctx_ && swapchain_) {
         float black[4] = {0.07f, 0.08f, 0.10f, 1};
         ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
@@ -325,15 +340,92 @@ void VideoPipeline::set_recorder(Recorder *rec) {
     recorder_ = rec;
 }
 
-bool VideoPipeline::prime_recorder() {
-    std::lock_guard<std::mutex> lock(mu_);
-    if (!recorder_ || !has_frame_.load() || !nv12_ || tex_w_ <= 0 || tex_h_ <= 0) {
-        return false;
+void VideoPipeline::request_render() {
+    {
+        std::lock_guard<std::mutex> lock(render_mu_);
+        render_dirty_ = true;
     }
-    // The picture on screen, stamped as if the phone had sent it just now.
-    int64_t pts = last_pts_us_ + (now_us() - last_local_us_);
-    recorder_->on_video_texture(device_, ctx_, nv12_, 0, tex_w_, tex_h_, pts);
-    return true;
+    render_cv_.notify_one();
+}
+
+void VideoPipeline::set_scene(int scene) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!device_ || scene < 0 || scene >= Studio::kSceneCount) {
+            return;
+        }
+        studio_.set_scene((Studio::Scene) scene, (double) now_us() / 1e6);
+    }
+    request_render();
+}
+
+int VideoPipeline::scene() {
+    std::lock_guard<std::mutex> lock(mu_);
+    return studio_.scene();
+}
+
+void VideoPipeline::set_framed(bool framed) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        studio_.set_framed(framed);
+    }
+    request_render();
+}
+
+bool VideoPipeline::set_background(int mode, const std::wstring &image_path) {
+    bg_mode_ = std::clamp(mode, 0, 2);
+    bg_path_ = image_path;
+    int cw, ch;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        cw = studio_.canvas_w();
+        ch = studio_.canvas_h();
+    }
+    // Decoded and scaled here, off the D3D lock: a large photo takes a moment.
+    std::vector<uint32_t> px;
+    if (bg_mode_ == Studio::Image) {
+        px = Studio::load_cover(bg_path_, cw, ch);
+    }
+    bool ok = bg_mode_ != Studio::Image || !px.empty();
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!device_) {
+            return ok;
+        }
+        studio_.set_background_image(px, cw, ch);
+        studio_.set_background(ok ? (Studio::Background) bg_mode_ : Studio::Colors);
+    }
+    request_render();
+    return ok;
+}
+
+void VideoPipeline::set_studio(int canvas_h, const std::vector<std::wstring> &texts) {
+    int ch = std::clamp(canvas_h, 360, 2160) & ~1;
+    int cw = (ch * 16 / 9) & ~1;
+    // The title cards are drawn with GDI+ here, off the D3D lock, then uploaded in one go.
+    std::vector<uint32_t> px[Studio::kSceneCount];
+    for (int s = 0; s < Studio::kSceneCount; ++s) {
+        Studio::Text t;
+        if ((size_t) s * 2 + 1 < texts.size()) {
+            t.title = texts[(size_t) s * 2];
+            t.subtitle = texts[(size_t) s * 2 + 1];
+        }
+        px[s] = Studio::build_overlay((Studio::Scene) s, t, cw, ch);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!device_) {
+            return;
+        }
+        studio_.set_canvas_size(cw, ch);
+        for (int s = 0; s < Studio::kSceneCount; ++s) {
+            studio_.set_overlay((Studio::Scene) s, px[s], cw, ch);
+        }
+    }
+    if (bg_mode_ == Studio::Image) {
+        set_background(bg_mode_, bg_path_); // the picture is cut to the canvas size, so recut it
+    }
+    request_render();
 }
 
 void VideoPipeline::set_first_frame_fn(std::function<void()> fn) {
@@ -856,14 +948,13 @@ void VideoPipeline::decode_packet(const EncodedPacket &pkt, bool present) {
         } else if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P) {
             upload_yuv420(frame->data[0], frame->linesize[0], frame->data[1], frame->data[2], frame->linesize[1], w, h);
         }
-        last_pts_us_ = frame->pts != AV_NOPTS_VALUE ? frame->pts : now_us();
-        last_local_us_ = now_us();
-        if (recorder_ && recorder_->active()) {
-            recorder_->on_video_frame(device_, ctx_, frame, w, h);
+        if (recorder_ && frame->pts != AV_NOPTS_VALUE) {
+            recorder_->note_clock(frame->pts, now_us()); // lines iPhone audio up with the local clock
         }
+        src_dirty_ = true;
         bool first = !has_frame_.exchange(true);
         if (present || first) {
-            present_nv12();
+            request_render(); // the render thread composes and shows it
         }
         av_frame_unref(frame);
         if (first && first_frame_fn_) {
@@ -896,8 +987,44 @@ void VideoPipeline::upload_yuv420(const uint8_t *y, int y_stride, const uint8_t 
     }
 }
 
-void VideoPipeline::present_nv12() {
-    if (!rtv_ || !swapchain_) {
+void VideoPipeline::render_loop() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    DWORD mmcss_idx = 0;
+    HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Games", &mmcss_idx);
+    while (render_run_) {
+        bool animating;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            animating = has_frame_.load() && studio_.animating((double) now_us() / 1e6);
+        }
+        {
+            // A fade or a drifting title card runs on a steady ~60 fps tick (new video just rides along);
+            // otherwise new video wakes us at once, and with nothing new we sleep.
+            std::unique_lock<std::mutex> lock(render_mu_);
+            if (animating) {
+                render_cv_.wait_for(lock, std::chrono::milliseconds(16), [this] { return !render_run_.load(); });
+            } else {
+                render_cv_.wait_for(lock, std::chrono::milliseconds(250),
+                                    [this] { return render_dirty_ || !render_run_; });
+            }
+            if (!render_run_) {
+                break;
+            }
+            if (!render_dirty_ && !animating) {
+                continue;
+            }
+            render_dirty_ = false;
+        }
+        std::lock_guard<std::mutex> lock(mu_);
+        render_once();
+    }
+    if (mmcss) {
+        AvRevertMmThreadCharacteristics(mmcss);
+    }
+}
+
+void VideoPipeline::render_once() {
+    if (!rtv_ || !swapchain_ || !has_frame_.load() || !nv12_) {
         return;
     }
     RECT rc = {};
@@ -907,82 +1034,32 @@ void VideoPipeline::present_nv12() {
     if (cw <= 0 || ch <= 0) {
         return;
     }
-
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (float) cw;
-    vp.Height = (float) ch;
-    vp.MaxDepth = 1;
-    ctx_->RSSetViewports(1, &vp);
-    ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
-    float black[4] = {0, 0, 0, 1};
-    ctx_->ClearRenderTargetView(rtv_, black);
-
-    float sx = 1, sy = 1;
-    int src_w = width_.load();
-    int src_h = height_.load();
-    if (src_w > 0 && src_h > 0) {
-        float va = (float) src_w / (float) src_h;
-        float wa = (float) cw / (float) ch;
-        if (cover_.load()) {
-            if (wa > va) {
-                sy = wa / va;
-            } else {
-                sx = va / wa;
-            }
-        } else if (wa > va) {
-            sx = va / wa;
-        } else {
-            sy = wa / va;
-        }
-    }
-
-    if (cbuf_ && (cw != present_cw_ || ch != present_ch_ || sx != letter_x_ || sy != letter_y_)) {
-        D3D11_MAPPED_SUBRESOURCE map = {};
-        if (SUCCEEDED(ctx_->Map(cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-            float *f = (float *) map.pData;
-            f[0] = sx;
-            f[1] = sy;
-            f[2] = 0;
-            f[3] = 0;
-            ctx_->Unmap(cbuf_, 0);
-        }
-        present_cw_ = cw;
-        present_ch_ = ch;
-        letter_x_ = sx;
-        letter_y_ = sy;
-    }
-    if (cbuf_) {
-        ctx_->VSSetConstantBuffers(0, 1, &cbuf_);
-    }
-    if (color_cbuf_ && color_cbuf_dirty_) {
-        D3D11_MAPPED_SUBRESOURCE map = {};
-        if (SUCCEEDED(ctx_->Map(color_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-            float *f = (float *) map.pData;
-            f[0] = full_range_ ? 1.0f : 0.0f;
-            f[1] = 0;
-            f[2] = 0;
-            f[3] = 0;
-            ctx_->Unmap(color_cbuf_, 0);
-        }
-        color_cbuf_dirty_ = false;
-    }
-    if (color_cbuf_) {
-        ctx_->PSSetConstantBuffers(1, 1, &color_cbuf_);
-    }
-
     UINT stride = sizeof(Vertex), offset = 0;
-    ctx_->IASetInputLayout(layout_);
-    ctx_->IASetVertexBuffers(0, 1, &vb_, &stride, &offset);
-    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-    ctx_->VSSetShader(vs_, nullptr, 0);
-    ctx_->PSSetShader(ps_, nullptr, 0);
-    ctx_->PSSetSamplers(0, 1, &sampler_);
-    ctx_->RSSetState(raster_);
-    ID3D11ShaderResourceView *srvs[2] = {srv_y_, srv_uv_};
-    ID3D11ShaderResourceView *none[2] = {};
+    auto bind_quad = [&] {
+        ctx_->IASetInputLayout(layout_);
+        ctx_->IASetVertexBuffers(0, 1, &vb_, &stride, &offset);
+        ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        ctx_->VSSetShader(vs_, nullptr, 0);
+        ctx_->PSSetSamplers(0, 1, &sampler_);
+        ctx_->RSSetState(raster_);
+        float factor[4] = {};
+        ctx_->OMSetBlendState(nullptr, factor, 0xffffffff);
+    };
 
-    if (ps_scale_ && unit_cbuf_ && scale_cbuf_ && tex_w_ > 0 && tex_h_ > 0 && ensure_rgba(tex_w_, tex_h_)) {
-        // Pass 1: NV12 -> RGB at the stream's own resolution, pixel for pixel.
+    // 1. A new picture: NV12 -> RGB at the stream's own resolution, then mips (for the blurred backdrop and
+    //    for scaling down without shimmer).
+    if (src_dirty_ && tex_w_ > 0 && tex_h_ > 0 && unit_cbuf_ && ensure_rgba(tex_w_, tex_h_)) {
+        if (color_cbuf_ && color_cbuf_dirty_) {
+            D3D11_MAPPED_SUBRESOURCE map = {};
+            if (SUCCEEDED(ctx_->Map(color_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+                float *f = (float *) map.pData;
+                f[0] = full_range_ ? 1.0f : 0.0f;
+                f[1] = f[2] = f[3] = 0;
+                ctx_->Unmap(color_cbuf_, 0);
+            }
+            color_cbuf_dirty_ = false;
+        }
+        bind_quad();
         D3D11_VIEWPORT svp = {};
         svp.Width = (float) tex_w_;
         svp.Height = (float) tex_h_;
@@ -990,42 +1067,97 @@ void VideoPipeline::present_nv12() {
         ctx_->RSSetViewports(1, &svp);
         ctx_->OMSetRenderTargets(1, &rgba_rtv_, nullptr);
         ctx_->VSSetConstantBuffers(0, 1, &unit_cbuf_);
+        ctx_->PSSetShader(ps_, nullptr, 0);
+        ctx_->PSSetConstantBuffers(1, 1, &color_cbuf_);
+        ID3D11ShaderResourceView *srvs[2] = {srv_y_, srv_uv_};
         ctx_->PSSetShaderResources(0, 2, srvs);
         ctx_->Draw(4, 0);
-        ctx_->PSSetShaderResources(0, 2, none);
-
-        // Pass 2: RGB -> window, bicubic from the mip level just above the on-screen size.
-        float scale = (std::min)((float) cw * sx / (float) tex_w_, (float) ch * sy / (float) tex_h_);
-        int lod = 0;
-        if (scale < 1.0f) {
-            lod = (int) std::floor(std::log2(1.0f / scale));
-            lod = (std::min)(lod, rgba_mips_ - 1);
-        }
-        if (lod > 0) {
-            ctx_->GenerateMips(rgba_srv_);
-        }
-        D3D11_MAPPED_SUBRESOURCE map = {};
-        if (SUCCEEDED(ctx_->Map(scale_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-            float *f = (float *) map.pData;
-            f[0] = (float) (std::max)(1, tex_w_ >> lod);
-            f[1] = (float) (std::max)(1, tex_h_ >> lod);
-            f[2] = (float) lod;
-            f[3] = 0;
-            ctx_->Unmap(scale_cbuf_, 0);
-        }
-        ctx_->RSSetViewports(1, &vp);
-        ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
-        ctx_->VSSetConstantBuffers(0, 1, &cbuf_);
-        ctx_->PSSetShader(ps_scale_, nullptr, 0);
-        ctx_->PSSetConstantBuffers(2, 1, &scale_cbuf_);
-        ctx_->PSSetShaderResources(0, 1, &rgba_srv_);
-        ctx_->Draw(4, 0);
-        ctx_->PSSetShaderResources(0, 1, none);
-    } else {
-        ctx_->PSSetShaderResources(0, 2, srvs);
-        ctx_->Draw(4, 0);
-        ctx_->PSSetShaderResources(0, 2, none);
+        ID3D11ShaderResourceView *none2[2] = {};
+        ctx_->PSSetShaderResources(0, 2, none2);
+        ID3D11RenderTargetView *no_rtv = nullptr;
+        ctx_->OMSetRenderTargets(1, &no_rtv, nullptr);
+        ctx_->GenerateMips(rgba_srv_);
+        src_dirty_ = false;
     }
+
+    // 2. The scene, on the 16:9 canvas.
+    studio_.render(rgba_ ? rgba_srv_ : nullptr, rgba_w_, rgba_h_, rgba_mips_, (double) now_us() / 1e6);
+
+    // 3. Recording gets the canvas exactly as composed: no window, no controls.
+    if (recorder_ && recorder_->active()) {
+        ID3D11Texture2D *y = nullptr, *uv = nullptr;
+        if (studio_.export_planes(&y, &uv)) {
+            recorder_->on_canvas(device_, ctx_, y, uv, studio_.canvas_w(), studio_.canvas_h(), now_us());
+        }
+    }
+
+    // 4. The window: the canvas fitted (or, full screen with Fill, cropped) to it, bicubic from the right mip.
+    int vw = studio_.canvas_w(), vh = studio_.canvas_h();
+    if (vw <= 0 || vh <= 0 || !ps_scale_ || !scale_cbuf_ || !cbuf_) {
+        return;
+    }
+    float sx = 1, sy = 1;
+    float va = (float) vw / (float) vh;
+    float wa = (float) cw / (float) ch;
+    if (cover_.load()) {
+        if (wa > va) {
+            sy = wa / va;
+        } else {
+            sx = va / wa;
+        }
+    } else if (wa > va) {
+        sx = va / wa;
+    } else {
+        sy = wa / va;
+    }
+    if (cw != present_cw_ || ch != present_ch_ || sx != letter_x_ || sy != letter_y_) {
+        D3D11_MAPPED_SUBRESOURCE map = {};
+        if (SUCCEEDED(ctx_->Map(cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+            float *f = (float *) map.pData;
+            f[0] = sx;
+            f[1] = sy;
+            f[2] = f[3] = 0;
+            ctx_->Unmap(cbuf_, 0);
+        }
+        present_cw_ = cw;
+        present_ch_ = ch;
+        letter_x_ = sx;
+        letter_y_ = sy;
+    }
+    float scale = (std::min)((float) cw * sx / (float) vw, (float) ch * sy / (float) vh);
+    int lod = 0;
+    if (scale < 1.0f) {
+        lod = (std::min)((int) std::floor(std::log2(1.0f / scale)), studio_.canvas_mips() - 1);
+    }
+    if (lod > 0) {
+        ctx_->GenerateMips(studio_.canvas_srv());
+    }
+    D3D11_MAPPED_SUBRESOURCE map = {};
+    if (SUCCEEDED(ctx_->Map(scale_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+        float *f = (float *) map.pData;
+        f[0] = (float) (std::max)(1, vw >> lod);
+        f[1] = (float) (std::max)(1, vh >> lod);
+        f[2] = (float) lod;
+        f[3] = 0;
+        ctx_->Unmap(scale_cbuf_, 0);
+    }
+    bind_quad();
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float) cw;
+    vp.Height = (float) ch;
+    vp.MaxDepth = 1;
+    ctx_->RSSetViewports(1, &vp);
+    ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
+    float bars[4] = {0.03f, 0.035f, 0.05f, 1};
+    ctx_->ClearRenderTargetView(rtv_, bars);
+    ctx_->VSSetConstantBuffers(0, 1, &cbuf_);
+    ctx_->PSSetShader(ps_scale_, nullptr, 0);
+    ctx_->PSSetConstantBuffers(2, 1, &scale_cbuf_);
+    ID3D11ShaderResourceView *canvas = studio_.canvas_srv();
+    ctx_->PSSetShaderResources(0, 1, &canvas);
+    ctx_->Draw(4, 0);
+    ID3D11ShaderResourceView *none = nullptr;
+    ctx_->PSSetShaderResources(0, 1, &none);
 
     // Smooth mode lines frames up with the display's refresh; otherwise show them the instant they're ready.
     HRESULT hr;

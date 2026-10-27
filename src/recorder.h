@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 struct ID3D11Device;
@@ -20,11 +21,11 @@ namespace airscreen {
 
 // Records the mirrored stream to MP4 (H.264 + AAC).
 //
-// The iPhone's own bitstream can't simply be copied: iOS sends a keyframe only when a session starts or the
-// screen rotates, so a clip started mid-session would have nothing to decode from. Instead decoded frames are
-// re-encoded, on the GPU when possible (NVENC, Quick Sync, AMF), with a keyframe every two seconds.
+// What is recorded is the studio canvas, exactly as composed (scene, framing, fades), encoded on the GPU when
+// possible (NVENC, Quick Sync, AMF) with a keyframe every two seconds. Everything runs on one local clock:
+// canvas frames and the mic are stamped locally, and the iPhone audio is moved onto it with note_clock().
 //
-// The decode thread only queues a GPU copy into a staging texture; the readback, encoding and disk writes
+// The render thread only queues a GPU copy into staging textures; the readback, encoding and disk writes
 // all happen on the recorder's own thread, so recording never holds up what's on screen. While recording,
 // the file is a fragmented "<name>.mp4.part", playable up to the last fragment even if AirScreen is killed
 // mid-clip; when the clip ends it is remuxed into a plain "<name>.mp4" that Windows' players open.
@@ -33,7 +34,7 @@ public:
     Recorder();
     ~Recorder();
 
-    // `path` is the first file; a rotation (new frame size) continues in "<name>_2.mp4" and so on.
+    // `path` is the first file; a change of canvas size continues in "<name>_2.mp4" and so on.
     bool start(const std::wstring &path);
     void stop();
     bool active() const { return active_.load(); }
@@ -42,12 +43,11 @@ public:
     std::string last_error() const;
     std::string encoder_name() const;
 
-    // Decode thread, with the video pipeline's D3D11 lock held. `frame` is an AVFrame.
-    void on_video_frame(ID3D11Device *device, ID3D11DeviceContext *ctx, const void *frame, int w, int h);
-    // A GPU NV12 picture (array slice `index`) at sender time `pts_us`; also how a clip is started from the
-    // picture already on screen, since iOS sends nothing new until the screen changes.
-    void on_video_texture(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, unsigned index,
-                          int w, int h, int64_t pts_us);
+    // Render thread, D3D11 lock held: the canvas as Y (R8) and CbCr (R8G8, half size) planes at local time.
+    void on_canvas(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *y, ID3D11Texture2D *uv, int w,
+                   int h, int64_t local_time_us);
+    // Decode thread: a picture stamped `sender_us` arrived at `local_time_us`; keeps the clock mapping current.
+    void note_clock(int64_t sender_us, int64_t local_time_us);
     // Audio decode thread.
     void on_audio_pcm(const int16_t *pcm, int frames, int channels, int rate, uint64_t ntp_ns);
 
@@ -64,8 +64,8 @@ private:
         int64_t pts_us = 0;
         int w = 0;
         int h = 0;
-        ID3D11Texture2D *staging = nullptr; // GPU frames: owned reference
-        void *sw_frame = nullptr;           // CPU-decoded frames: AVFrame clone
+        ID3D11Texture2D *staging = nullptr;    // Y plane copy, from the pool
+        ID3D11Texture2D *staging_uv = nullptr; // CbCr plane copy, from the pool
         std::vector<int16_t> pcm; // iPhone audio
         int channels = 0;
         int rate = 0;
@@ -79,7 +79,6 @@ private:
     bool encode_last_frame(int64_t pts_us);
     bool repeat_if_still();
     bool video_slot_free();
-    void push_video(Item &&it);
     void handle_audio(Item &it);
     void mix_in(int src, const float *pcm, int frames, int64_t at, bool timed);
     void pump_mix(bool flush, int64_t limit = INT64_MAX);
@@ -92,8 +91,8 @@ private:
     bool open_audio_encoder();
     bool write_packets(void *codec_ctx, void *stream, bool flush);
     void release_item(Item &it);
-    ID3D11Texture2D *take_staging(ID3D11Device *device, int w, int h);
-    void return_staging(ID3D11Texture2D *tex, int w, int h);
+    bool take_staging(ID3D11Device *device, int w, int h, Item &it);
+    void return_staging(Item &it);
     void set_error(const std::string &msg);
     std::wstring part_path(int part) const;
 
@@ -108,7 +107,7 @@ private:
     size_t queued_video_ = 0;
     uint64_t dropped_ = 0;
 
-    // Shared between the decode thread (producer) and the writer: the clip's zero point on the sender clock.
+    // Shared between the render thread (producer) and the writer: the clip's zero point, local clock.
     std::atomic<int64_t> base_us_{INT64_MIN};
     std::atomic<int64_t> last_video_us_{0};
     std::atomic<int64_t> base_local_us_{0}; // local time of the clip's first picture; 0 = none yet
@@ -125,10 +124,10 @@ private:
     std::atomic<float> mic_gain_{1.0f};
 
     std::mutex pool_mu_;
-    std::vector<ID3D11Texture2D *> pool_;
+    std::vector<std::pair<ID3D11Texture2D *, ID3D11Texture2D *>> pool_; // (Y, CbCr) staging pairs
     int pool_w_ = 0;
     int pool_h_ = 0;
-    int pool_out_ = 0; // textures of the current size handed out and not yet returned
+    int pool_out_ = 0; // pairs of the current size handed out and not yet returned
     ID3D11DeviceContext *ctx_ = nullptr; // borrowed from the video pipeline, used for Map on the writer thread
 
     mutable std::mutex info_mu_;
