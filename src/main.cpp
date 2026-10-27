@@ -38,6 +38,8 @@ constexpr UINT kTimerOverlay = 1;
 constexpr UINT kTimerDisconnect = 2;
 constexpr UINT kTimerDrift = 3;
 constexpr UINT kTimerRec = 4;
+constexpr UINT kTimerPin = 5;
+constexpr UINT kPinMs = 90000; // a PIN nobody typed in this long is stale
 constexpr UINT kOverlayHideMs = 2200;
 constexpr UINT kDisconnectMs = 400;
 UINT g_taskbar_created = 0;
@@ -380,7 +382,9 @@ void return_to_menu(App *app) {
     app->mirroring = false;
     app->scene = 1; // the pipeline resets to Screen when the session ends
     app->overlay_status = L"Ready to connect";
-    app->overlay_pin.clear();
+    // The PIN stays: iOS drops the connection the moment it shows its PIN prompt and reconnects once the PIN
+    // is typed, so this disconnect is exactly when the PIN needs to be on screen. It goes when the device
+    // reconnects, or after kPinMs.
     if (app->video_hwnd) {
         ShowWindow(app->video_hwnd, SW_HIDE);
     }
@@ -1128,6 +1132,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             if (WindowFromPoint(pt) != app->settings_hwnd) {
                 show_settings_button(app, false);
             }
+        } else if (wparam == kTimerPin) {
+            KillTimer(hwnd, kTimerPin);
+            app->overlay_pin.clear();
+            InvalidateRect(hwnd, nullptr, FALSE);
         } else if (wparam == kTimerDisconnect) {
             KillTimer(hwnd, kTimerDisconnect);
             return_to_menu(app);
@@ -1196,7 +1204,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             KillTimer(hwnd, kTimerDisconnect);
             set_boost(true);
             app->connected = true;
-            app->overlay_pin.clear();
+            app->overlay_pin.clear(); // the device is back: the PIN was typed
+            KillTimer(hwnd, kTimerPin);
             app->overlay_status = L"Connected";
             if (!msg.empty()) {
                 app->overlay_status = L"Connected: " + app->utf16(msg);
@@ -1214,6 +1223,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             break;
         case airscreen::UiEvent::Pin:
             app->overlay_pin = app->utf16(msg);
+            SetTimer(hwnd, kTimerPin, kPinMs, nullptr);
+            // The PIN is useless unless it's seen: bring the window up, even from the tray.
+            if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            SetForegroundWindow(hwnd);
+            FlashWindow(hwnd, TRUE);
             InvalidateRect(hwnd, nullptr, FALSE);
             break;
         case airscreen::UiEvent::Log:

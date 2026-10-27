@@ -119,7 +119,7 @@ endif()
 if (MSVC)
     set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} /I\"${CMAKE_SOURCE_DIR}/src/app\"")
     set_property(SOURCE src/app/airscreen.rc APPEND PROPERTY
-        OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/src/app/app.ico")
+        OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/src/app/app.ico;${CMAKE_SOURCE_DIR}/src/app/logo_hi.png")
 endif()
 
 # --- AirScreen app ---

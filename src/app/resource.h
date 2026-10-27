@@ -3,6 +3,7 @@
 #define IDD_RENAME          101
 #define IDC_NAME            1001
 #define IDI_APP             102
+#define IDR_LOGO            103  // logo_hi.png, drawn on the home screen
 
 #define IDM_TRAY_SHOW       40001
 #define IDM_TRAY_RENAME     40002

@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>
+#include <shlwapi.h>
 
 #include "ui.h"
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "shlwapi.lib")
 
 using Gdiplus::Bitmap;
 using Gdiplus::Color;
@@ -405,63 +407,46 @@ void fill_round_grad(Graphics &g, const RectF &r, float rad, const Color &a, con
     g.FillPath(&br, &p);
 }
 
-// The AirScreen logo, as in src/app/app.ico (scripts/make-icon.py): a monitor on a stand with AirPlay-style
-// signal arcs over a lit dot, drawn in the same 256-unit design space into `box`. `t` >= 0 animates the arcs
-// as a signal travelling outward; `accent` tints arcs and dot (Continuity blue by default).
-void draw_logo(Graphics &g, RectF box, double t, const Color &accent) {
-    float k = box.Width / 256.f;
-    auto R = [&](float x, float y, float w, float h) { return RectF(box.X + x * k, box.Y + y * k, w * k, h * k); };
-    RectF body = R(6, 28, 244, 172), screen = R(14, 36, 228, 156);
-    fill_round_grad(g, body, 22 * k, Color(255, 64, 64, 68), Color(255, 40, 40, 42), 90.f);
-    {
-        // Top sheen, then the hairline rim.
-        GraphicsPath p;
-        add_round_rect(p, body, 22 * k);
-        RectF top(body.X, body.Y, body.Width, 56 * k);
-        LinearGradientBrush sheen(top, Color(20, 255, 255, 255), Color(0, 255, 255, 255), 90.f);
-        g.SetClip(&p);
-        g.FillRectangle(&sheen, top);
-        g.ResetClip();
-    }
-    draw_round(g, body, 22 * k, Color(255, 106, 106, 112), (std::max)(1.f, 1.25f * k));
-    fill_round_grad(g, screen, 14 * k, Color(255, 28, 28, 30), Color(255, 14, 14, 16), 90.f);
-
-    float cx = box.X + 128 * k, cy = box.Y + 134 * k;
-    {
-        // A soft glow behind the arcs.
-        GraphicsPath glow;
-        glow.AddEllipse(cx - 48 * k, box.Y + 88 * k, 96 * k, 64 * k);
-        Gdiplus::PathGradientBrush pg(&glow);
-        pg.SetCenterColor(Color(t >= 0 ? 34 : 22, accent.GetR(), accent.GetG(), accent.GetB()));
-        Color edge(0, accent.GetR(), accent.GetG(), accent.GetB());
-        int n = 1;
-        pg.SetSurroundColors(&edge, &n);
-        g.FillPath(&pg, &glow);
-    }
-    const float radius[3] = {25, 47, 67}, width[3] = {3.5f, 3.f, 3.f}, base_a[3] = {0.60f, 0.35f, 0.18f};
-    for (int i = 0; i < 3; ++i) {
-        float a = base_a[i];
-        if (t >= 0) {
-            // The signal: each arc brightens in turn, inner to outer, then rests.
-            float wave = (float) sin(t * 2.4 - i * 0.9);
-            a += 0.42f * (wave > 0 ? wave * wave : 0.f);
+// The AirScreen logo (src/app/logo_hi.png, embedded as a resource), decoded once. The stream stays alive with
+// the bitmap, as GDI+ requires.
+Bitmap *logo_bitmap() {
+    static Bitmap *bmp = [] () -> Bitmap * {
+        HMODULE mod = GetModuleHandleW(nullptr);
+        HRSRC res = FindResourceW(mod, MAKEINTRESOURCEW(103 /* IDR_LOGO */), MAKEINTRESOURCEW(10) /* RT_RCDATA */);
+        HGLOBAL data = res ? LoadResource(mod, res) : nullptr;
+        const BYTE *bytes = data ? (const BYTE *) LockResource(data) : nullptr;
+        if (!bytes) {
+            return nullptr;
         }
-        Pen p(Color((BYTE) (std::min)(255.f, a * 255.f), accent.GetR(), accent.GetG(), accent.GetB()),
-              width[i] * k);
-        p.SetStartCap(LineCapRound);
-        p.SetEndCap(LineCapRound);
-        float r = radius[i] * k;
-        g.DrawArc(&p, cx - r, cy - r, r * 2, r * 2, 203.6f, 132.8f); // the upper cap, as in the icon
+        IStream *stream = SHCreateMemStream(bytes, SizeofResource(mod, res));
+        if (!stream) {
+            return nullptr;
+        }
+        auto *b = new Bitmap(stream);
+        if (b->GetLastStatus() != Gdiplus::Ok) {
+            delete b;
+            stream->Release();
+            return nullptr;
+        }
+        return b; // lives for the process, with its stream
+    }();
+    return bmp;
+}
+
+void draw_logo_image(Graphics &g, const RectF &box) {
+    Bitmap *bmp = logo_bitmap();
+    if (!bmp) {
+        return;
     }
-    SolidBrush dot(Color(230, accent.GetR(), accent.GetG(), accent.GetB()));
-    g.FillEllipse(&dot, cx - 6 * k, cy - 6 * k, 12 * k, 12 * k);
-    fill_round(g, R(118, 200, 20, 14), 2 * k, Color(255, 58, 58, 60));
-    fill_round(g, R(102, 216, 52, 5), 2.5f * k, Color(255, 72, 72, 74));
+    auto mode = g.GetInterpolationMode();
+    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    g.DrawImage(bmp, box);
+    g.SetInterpolationMode(mode);
 }
 
 void draw_mark(Graphics &g, RectF box) {
-    // Fallback window icon only; the shipped icon is src/app/app.ico, the same drawing.
-    draw_logo(g, box, -1, Color(255, 10, 132, 255));
+    // Fallback window icon only; the shipped icon is src/app/app.ico, made from the same picture.
+    draw_logo_image(g, box);
 }
 
 HICON icon_from_size(int size) {
@@ -592,14 +577,14 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
     float icx = x + col_w + (avail - col_w) * 0.5f;
     float icy = (float) h * 0.44f;
     RectF logo(icx - ls * 0.5f, icy - ls * 0.5f, ls, ls);
-    float lk = ls / 256.f;
-    RectF logo_body(logo.X + 6 * lk, logo.Y + 28 * lk, 244 * lk, 172 * lk);
+    // While waiting the logo floats a few pixels up and down, slowly.
+    float float_y = mood == Mood::Wait ? D(5) * (float) sin(t * 0.9) : 0.f;
 
     // Everything set straight on the field: the name (or PIN) lockup and the iPad. It runs twice, once into the
     // shadow mask and once for real, so the shadow always sits under exactly what is drawn.
     auto field_text = [&](Graphics &g, bool real) {
         if (art && !real) {
-            fill_round(g, logo_body, 22 * lk, Color(190, 0, 0, 0));
+            draw_logo_image(g, RectF(logo.X, logo.Y + float_y, ls, ls)); // its own shape casts the shadow
         }
         if (real) {
             g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
@@ -716,20 +701,26 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
         }
 
         if (art) {
-            // The logo itself. Its arcs carry the state: a travelling signal while waiting, amber while
-            // pairing, steady green once live, grey when AirPlay couldn't start.
-            Color accent = mood == Mood::Pair   ? Color(255, 255, 176, 64)
-                           : mood == Mood::Live ? Color(255, 72, 220, 140)
-                           : mood == Mood::Fail ? Color(255, 150, 150, 156)
-                                                : Color(255, 10, 132, 255);
-            draw_logo(g, logo, mood == Mood::Wait ? t : -1, accent);
+            // A soft glow under the logo that breathes while waiting, then the logo itself.
+            {
+                float k = mood == Mood::Wait ? 0.5f + 0.5f * (float) sin(t * 1.6) : 0.4f;
+                GraphicsPath glow;
+                glow.AddEllipse(icx - ls * 0.52f, icy - ls * 0.36f + float_y, ls * 1.04f, ls * 0.72f);
+                Gdiplus::PathGradientBrush pg(&glow);
+                pg.SetCenterColor(Color((BYTE) (40 + 50 * k), 60, 150, 255));
+                Color edge(0, 60, 150, 255);
+                int n = 1;
+                pg.SetSurroundColors(&edge, &n);
+                g.FillPath(&pg, &glow);
+            }
+            draw_logo_image(g, RectF(logo.X, logo.Y + float_y, ls, ls));
 
             // Shortcuts and the PC's address under the logo, small enough to ignore until needed.
             Font hint_f(face_text(), D(13), FontStyleRegular, UnitPixel);
             Color faint(160, 255, 255, 255);
             const wchar_t *keys =
                 L"Ctrl+R record   ·   Ctrl+M mic   ·   1–4 scenes   ·   F11 full screen";
-            float base = logo.Y + 221 * lk + D(40); // under the stand's base
+            float base = logo.Y + ls * 0.98f + D(18); // just under the picture
             float kw = (std::min)(width_of(g, keys, hint_f), avail - col_w);
             draw_line(g, keys, hint_f, icx - kw * 0.5f, base, avail - col_w, faint);
             if (!view.detail.empty()) {
