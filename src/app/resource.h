@@ -15,3 +15,7 @@
 #define IDM_TRAY_FILL       40009
 #define IDC_SETTINGS        40010
 #define IDM_TRAY_STARTUP    40011
+#define IDM_REC_TOGGLE      40012
+#define IDM_REC_FOLDER      40013
+#define IDM_QUALITY         40014
+#define IDM_SMOOTH          40015

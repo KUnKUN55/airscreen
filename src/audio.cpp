@@ -446,6 +446,9 @@ void AudioPipeline::convert_and_push(const uint8_t **src, int in_samples) {
 }
 
 void AudioPipeline::push_pcm(const int16_t *pcm, int frames, int channels) {
+    if (tap_ && frames > 0) {
+        tap_(pcm, frames, channels, out_rate_, cur_ntp_);
+    }
     std::lock_guard<std::mutex> lock(mu_);
     if (ring_.empty() || frames <= 0 || channels <= 0) {
         return;
@@ -488,12 +491,17 @@ void AudioPipeline::push_pcm(const int16_t *pcm, int frames, int channels) {
     }
 }
 
+void AudioPipeline::set_pcm_tap(PcmTap tap) {
+    std::lock_guard<std::mutex> dlock(dec_mu_);
+    tap_ = std::move(tap);
+}
+
 void AudioPipeline::submit(const uint8_t *data, int len, uint64_t ntp_ns) {
-    (void) ntp_ns;
     if (!data || len <= 0) {
         return;
     }
     std::lock_guard<std::mutex> dlock(dec_mu_);
+    cur_ntp_ = ntp_ns;
     if (pcm_passthrough_) {
         int in_ch = src_ch_ > 0 ? src_ch_ : 2;
         int frames = len / (2 * in_ch);

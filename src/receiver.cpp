@@ -10,6 +10,7 @@
 #endif
 #include <windows.h>
 
+#include <algorithm>
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
@@ -175,6 +176,11 @@ bool Receiver::start(HWND hwnd, const Settings &settings, UiFn ui) {
             ui_(UiEvent::VideoReady, {});
         }
     });
+    video_.set_smooth(settings_.smooth);
+    video_.set_recorder(&recorder_);
+    audio_.set_pcm_tap([this](const int16_t *pcm, int frames, int channels, int rate, uint64_t ntp_ns) {
+        recorder_.on_audio_pcm(pcm, frames, channels, rate, ntp_ns);
+    });
     on_log(LOGGER_INFO, "starting mDNS");
     if (!start_dnssd()) {
         stop();
@@ -203,9 +209,34 @@ void Receiver::stop() {
         raop_destroy((raop_t *) raop_);
         raop_ = nullptr;
     }
+    recorder_.stop();
     audio_.stop();
+    video_.set_recorder(nullptr);
     video_.shutdown();
     connected_ = false;
+}
+
+bool Receiver::set_high_quality(bool on) {
+    settings_.high_quality = on;
+    if (raop_) {
+        raop_set_plist((raop_t *) raop_, "width", display_width());
+        raop_set_plist((raop_t *) raop_, "height", display_height());
+    }
+    // Re-advertise so the HEVC feature bit changes; iOS picks it up on the next connection.
+    return rename(name_);
+}
+
+void Receiver::set_smooth(bool on) {
+    settings_.smooth = on;
+    video_.set_smooth(on);
+}
+
+int Receiver::display_width() const {
+    return settings_.high_quality ? (std::max)(settings_.width, 3840) : settings_.width;
+}
+
+int Receiver::display_height() const {
+    return settings_.high_quality ? (std::max)(settings_.height, 2160) : settings_.height;
 }
 
 bool Receiver::rename(const std::string &name) {
@@ -283,7 +314,8 @@ void Receiver::apply_features() {
     dnssd_set_airplay_features(ds, 29, 0);
     dnssd_set_airplay_features(ds, 30, 1);
     dnssd_set_airplay_features(ds, 31, 0);
-    dnssd_set_airplay_features(ds, 42, 0); // h265 off, h264 only for MVP
+    // SupportsScreenMultiCodec: lets iOS send HEVC, which it pairs with a 4K display for a sharper stream.
+    dnssd_set_airplay_features(ds, 42, settings_.high_quality ? 1 : 0);
 }
 
 bool Receiver::start_raop() {
@@ -325,8 +357,8 @@ bool Receiver::start_raop() {
         raop_destroy(raop);
         return false;
     }
-    raop_set_plist(raop, "width", settings_.width);
-    raop_set_plist(raop, "height", settings_.height);
+    raop_set_plist(raop, "width", display_width());
+    raop_set_plist(raop, "height", display_height());
     raop_set_plist(raop, "refreshRate", settings_.refresh_hz);
     raop_set_plist(raop, "maxFPS", settings_.max_fps);
     if (pin_pw_ == 1 && settings_.pin) {
@@ -418,6 +450,12 @@ void Receiver::teardown_session() {
     bool was = connected_.exchange(false);
     bool had_frame = video_.has_frame();
     on_log(LOGGER_INFO, "session teardown");
+    if (recorder_.active()) {
+        recorder_.stop();
+        if (ui_) {
+            ui_(UiEvent::RecordingStopped, recorder_.last_error());
+        }
+    }
     audio_.stop();
     video_.flush();
     video_.clear();

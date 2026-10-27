@@ -136,6 +136,10 @@ Settings load_settings() {
             s.height = atoi(val.c_str()) > 0 ? atoi(val.c_str()) : s.height;
         } else if (key == "MaxFps") {
             s.max_fps = atoi(val.c_str()) > 0 ? atoi(val.c_str()) : s.max_fps;
+        } else if (key == "HighQuality") {
+            s.high_quality = (val == "1" || val == "true");
+        } else if (key == "Smooth") {
+            s.smooth = (val == "1" || val == "true");
         } else if (key == "Window") {
             sscanf(val.c_str(), "%d,%d,%d,%d", &s.win_x, &s.win_y, &s.win_w, &s.win_h);
         }
@@ -154,6 +158,8 @@ void save_settings(const Settings &s) {
     out << "Width=" << s.width << "\n";
     out << "Height=" << s.height << "\n";
     out << "MaxFps=" << s.max_fps << "\n";
+    out << "HighQuality=" << (s.high_quality ? 1 : 0) << "\n";
+    out << "Smooth=" << (s.smooth ? 1 : 0) << "\n";
     out << "Window=" << s.win_x << "," << s.win_y << "," << s.win_w << "," << s.win_h << "\n";
 }
 

@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <objbase.h>
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -30,6 +31,7 @@ constexpr UINT kTrayId = 1;
 constexpr UINT kTimerOverlay = 1;
 constexpr UINT kTimerDisconnect = 2;
 constexpr UINT kTimerDrift = 3;
+constexpr UINT kTimerRec = 4;
 constexpr UINT kOverlayHideMs = 2200;
 constexpr UINT kDisconnectMs = 400;
 UINT g_taskbar_created = 0;
@@ -62,6 +64,7 @@ struct App {
     std::wstring overlay_pin;
     std::wstring overlay_detail;
     bool connected = false;
+    bool recording = false;
     HICON icon = nullptr;
     HICON icon_sm = nullptr;
 
@@ -99,13 +102,85 @@ void apply_topmost(HWND hwnd, bool on) {
 }
 
 void update_title(App *app) {
-    std::wstring t = L"AirScreen - " + app->utf16(app->settings.name);
+    std::wstring t;
+    if (app->recording) {
+        int s = (int) app->receiver.recorder().seconds();
+        wchar_t rec[48];
+        swprintf_s(rec, L"● REC %02d:%02d:%02d - ", s / 3600, s / 60 % 60, s % 60);
+        t = rec;
+    }
+    t += L"AirScreen - " + app->utf16(app->settings.name);
     if (app->connected) {
         t += L" - Live";
     } else {
         t += L" - Waiting";
     }
     SetWindowTextW(app->hwnd, t.c_str());
+}
+
+std::wstring recordings_dir() {
+    std::wstring dir;
+    PWSTR videos = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Videos, KF_FLAG_CREATE, nullptr, &videos))) {
+        dir = videos;
+    }
+    CoTaskMemFree(videos);
+    if (dir.empty()) {
+        dir = airscreen::app_data_dir();
+    }
+    dir += L"\\AirScreen";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+void tray_balloon(App *app, const std::wstring &title, const std::wstring &text) {
+    NOTIFYICONDATAW n = app->nid;
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_INFO;
+    wcsncpy_s(n.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(n.szInfo, text.c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+// Called when a clip ends for any reason: the user stopped it, mirroring ended, or the writer failed.
+void finish_recording(App *app, const std::string &error) {
+    if (!app->recording) {
+        return;
+    }
+    app->recording = false;
+    KillTimer(app->hwnd, kTimerRec);
+    update_title(app);
+    std::wstring path = app->receiver.recorder().path();
+    if (!error.empty()) {
+        MessageBoxW(app->hwnd, (L"Recording stopped: " + app->utf16(error)).c_str(), L"AirScreen",
+                    MB_OK | MB_ICONWARNING);
+    } else {
+        size_t slash = path.find_last_of(L'\\');
+        tray_balloon(app, L"Clip saved", slash == std::wstring::npos ? path : path.substr(slash + 1));
+    }
+}
+
+void toggle_recording(App *app) {
+    auto &rec = app->receiver.recorder();
+    if (app->recording) {
+        rec.stop();
+        finish_recording(app, rec.last_error());
+        return;
+    }
+    if (!app->mirroring) {
+        MessageBoxW(app->hwnd, L"Start mirroring from your iPhone first, then record.", L"AirScreen",
+                    MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t name[64];
+    swprintf_s(name, L"\\AirScreen_%04d-%02d-%02d_%02d-%02d-%02d.mp4", st.wYear, st.wMonth, st.wDay, st.wHour,
+               st.wMinute, st.wSecond);
+    rec.start(recordings_dir() + name);
+    app->recording = true;
+    SetTimer(app->hwnd, kTimerRec, 500, nullptr);
+    update_title(app);
 }
 
 void apply_video_fill(App *app) {
@@ -290,6 +365,15 @@ void popup_settings_menu(App *app, POINT screen_pt, bool tray) {
     if (tray) {
         AppendMenuW(m, MF_STRING, IDM_TRAY_SHOW, L"Show AirScreen");
     }
+    AppendMenuW(m, MF_STRING | (app->mirroring || app->recording ? 0 : MF_GRAYED), IDM_REC_TOGGLE,
+                app->recording ? L"Stop recording\tCtrl+R" : L"Record clip\tCtrl+R");
+    AppendMenuW(m, MF_STRING, IDM_REC_FOLDER, L"Open recordings folder");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (app->settings.high_quality ? MF_CHECKED : 0), IDM_QUALITY,
+                L"High quality (4K, HEVC)");
+    AppendMenuW(m, MF_STRING | (app->settings.smooth ? MF_CHECKED : 0), IDM_SMOOTH,
+                L"Smooth playback (+60 ms delay)");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_TRAY_RENAME, L"Rename receiver…");
     AppendMenuW(m, MF_STRING | (app->settings.always_on_top ? MF_CHECKED : 0), IDM_TRAY_TOP, L"Always on top");
     AppendMenuW(m, MF_STRING | (app->settings.require_pin ? MF_CHECKED : 0), IDM_TRAY_PIN, L"Require pairing PIN");
@@ -369,6 +453,28 @@ void handle_tray_cmd(App *app, UINT id) {
         break;
     case IDM_TRAY_STARTUP:
         airscreen::set_start_with_windows(!airscreen::start_with_windows());
+        break;
+    case IDM_REC_TOGGLE:
+        toggle_recording(app);
+        break;
+    case IDM_REC_FOLDER: {
+        auto dir = recordings_dir();
+        ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        break;
+    }
+    case IDM_QUALITY:
+        app->settings.high_quality = !app->settings.high_quality;
+        airscreen::save_settings(app->settings);
+        app->receiver.set_high_quality(app->settings.high_quality);
+        if (app->connected) {
+            MessageBoxW(app->hwnd, L"Stop and restart mirroring on the iPhone to apply the new quality.",
+                        L"AirScreen", MB_OK | MB_ICONINFORMATION);
+        }
+        break;
+    case IDM_SMOOTH:
+        app->settings.smooth = !app->settings.smooth;
+        airscreen::save_settings(app->settings);
+        app->receiver.set_smooth(app->settings.smooth);
         break;
     case IDM_TRAY_FIREWALL:
         if (!airscreen::ensure_firewall_rule()) {
@@ -624,6 +730,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             return_to_menu(app);
         } else if (wparam == kTimerDrift && !app->mirroring) {
             InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (wparam == kTimerRec) {
+            if (app->recording && !app->receiver.recorder().active()) {
+                app->receiver.recorder().stop();
+                finish_recording(app, app->receiver.recorder().last_error());
+            } else {
+                update_title(app);
+            }
         }
         return 0;
     case WM_LBUTTONDBLCLK:
@@ -652,6 +765,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             toggle_fullscreen(app);
         } else if (wparam == VK_F2) {
             do_rename(app);
+        } else if (wparam == VK_F9 || (wparam == 'R' && (GetKeyState(VK_CONTROL) & 0x8000))) {
+            toggle_recording(app);
         } else if (wparam == VK_ESCAPE && app->fullscreen) {
             set_fullscreen(app, false);
         }
@@ -689,6 +804,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         case airscreen::UiEvent::Log:
             app->overlay_detail = app->utf16(msg);
             break;
+        case airscreen::UiEvent::RecordingStopped:
+            finish_recording(app, msg);
+            break;
         case airscreen::UiEvent::VideoSize:
         case airscreen::UiEvent::ClientName:
             if (ev == airscreen::UiEvent::ClientName && !msg.empty()) {
@@ -723,6 +841,11 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             app->settings.win_h = r.bottom - r.top;
             airscreen::save_settings(app->settings);
         }
+        if (app->recording) {
+            app->receiver.recorder().stop(); // finalize the clip before the window goes away
+            app->recording = false;
+        }
+        KillTimer(hwnd, kTimerRec);
         KillTimer(hwnd, kTimerDrift);
         KillTimer(hwnd, kTimerOverlay);
         KillTimer(hwnd, kTimerDisconnect);
@@ -940,6 +1063,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
+        // Shortcuts work whichever of our windows (main, video surface, gear button) has focus.
+        if (msg.message == WM_KEYDOWN && msg.hwnd != app.hwnd && app.hwnd && IsChild(app.hwnd, msg.hwnd)) {
+            msg.hwnd = app.hwnd;
+        }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }

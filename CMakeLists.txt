@@ -128,6 +128,7 @@ add_executable(AirScreen WIN32
     src/receiver.cpp
     src/video.cpp
     src/audio.cpp
+    src/recorder.cpp
     src/settings.cpp
     src/ui.cpp
     src/openssl_applink.c
@@ -159,7 +160,7 @@ target_link_libraries(AirScreen PRIVATE
 )
 if (MSVC)
     set_source_files_properties(
-        src/main.cpp src/receiver.cpp src/video.cpp src/audio.cpp src/settings.cpp
+        src/main.cpp src/receiver.cpp src/video.cpp src/audio.cpp src/recorder.cpp src/settings.cpp
         PROPERTIES COMPILE_OPTIONS "/utf-8;/W3;/wd4996;/FI${COMPAT_DIR}/airscreen_types.h")
     set_source_files_properties(src/ui.cpp PROPERTIES COMPILE_OPTIONS "/utf-8;/W3")
     # Keep OPENSSL_Applink in the EXE export table (OpenSSL GetProcAddress).

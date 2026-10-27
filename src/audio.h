@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <vector>
 #include <atomic>
@@ -9,6 +10,9 @@ namespace airscreen {
 
 class AudioPipeline {
 public:
+    // Decoded PCM before volume: interleaved S16, with the sender timestamp of the packet it came from.
+    using PcmTap = std::function<void(const int16_t *pcm, int frames, int channels, int rate, uint64_t ntp_ns)>;
+
     AudioPipeline();
     ~AudioPipeline();
 
@@ -17,6 +21,7 @@ public:
     void flush();
     void set_volume(float linear); // 0..1
     void submit(const uint8_t *data, int len, uint64_t ntp_ns);
+    void set_pcm_tap(PcmTap tap);
     bool is_running() const { return running_.load(); }
     void render_thread();
 
@@ -65,6 +70,8 @@ private:
     std::atomic<bool> running_{false};
     unsigned char codec_type_ = 0;
     bool pcm_passthrough_ = false;
+    PcmTap tap_;          // guarded by dec_mu_
+    uint64_t cur_ntp_ = 0; // timestamp of the packet being decoded; guarded by dec_mu_
 };
 
 } // namespace airscreen

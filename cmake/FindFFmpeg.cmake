@@ -29,6 +29,10 @@ function(_airscreen_ffmpeg_from_root root)
         NAMES swresample swresample.lib
         PATHS "${root}/lib" "${root}/bin"
         NO_DEFAULT_PATH)
+    find_library(FFMPEG_AVFORMAT_LIBRARY
+        NAMES avformat avformat.lib
+        PATHS "${root}/lib" "${root}/bin"
+        NO_DEFAULT_PATH)
 endfunction()
 
 if (DEFINED ENV{FFMPEG_ROOT} AND NOT FFMPEG_ROOT)
@@ -71,12 +75,19 @@ if (NOT FFMPEG_INCLUDE_DIR)
     endforeach()
 endif()
 
+# A cache from before avformat was needed already has the other libraries; look beside them.
+if (FFMPEG_AVCODEC_LIBRARY AND NOT FFMPEG_AVFORMAT_LIBRARY)
+    get_filename_component(_ff_libdir "${FFMPEG_AVCODEC_LIBRARY}" DIRECTORY)
+    find_library(FFMPEG_AVFORMAT_LIBRARY NAMES avformat avformat.lib PATHS "${_ff_libdir}" NO_DEFAULT_PATH)
+endif()
+
 if (NOT FFMPEG_INCLUDE_DIR)
     find_path(FFMPEG_INCLUDE_DIR NAMES libavcodec/avcodec.h)
     find_library(FFMPEG_AVCODEC_LIBRARY NAMES avcodec)
     find_library(FFMPEG_AVUTIL_LIBRARY NAMES avutil)
     find_library(FFMPEG_SWSCALE_LIBRARY NAMES swscale)
     find_library(FFMPEG_SWRESAMPLE_LIBRARY NAMES swresample)
+    find_library(FFMPEG_AVFORMAT_LIBRARY NAMES avformat)
 endif()
 
 include(FindPackageHandleStandardArgs)
@@ -86,7 +97,8 @@ find_package_handle_standard_args(FFmpeg
         FFMPEG_AVCODEC_LIBRARY
         FFMPEG_AVUTIL_LIBRARY
         FFMPEG_SWSCALE_LIBRARY
-        FFMPEG_SWRESAMPLE_LIBRARY)
+        FFMPEG_SWRESAMPLE_LIBRARY
+        FFMPEG_AVFORMAT_LIBRARY)
 
 if (FFmpeg_FOUND AND NOT TARGET FFmpeg::FFmpeg)
     add_library(FFmpeg::FFmpeg INTERFACE IMPORTED)
@@ -95,7 +107,8 @@ if (FFmpeg_FOUND AND NOT TARGET FFmpeg::FFmpeg)
         "${FFMPEG_AVCODEC_LIBRARY}"
         "${FFMPEG_AVUTIL_LIBRARY}"
         "${FFMPEG_SWSCALE_LIBRARY}"
-        "${FFMPEG_SWRESAMPLE_LIBRARY}")
+        "${FFMPEG_SWRESAMPLE_LIBRARY}"
+        "${FFMPEG_AVFORMAT_LIBRARY}")
     get_filename_component(FFMPEG_BIN_DIR "${FFMPEG_AVCODEC_LIBRARY}" DIRECTORY)
     if (EXISTS "${FFMPEG_BIN_DIR}/../bin")
         get_filename_component(FFMPEG_BIN_DIR "${FFMPEG_BIN_DIR}/../bin" ABSOLUTE)

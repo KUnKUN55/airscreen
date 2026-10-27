@@ -1,4 +1,5 @@
 #include "video.h"
+#include "recorder.h"
 #include "settings.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -12,6 +13,7 @@
 #include <d3dcompiler.h>
 #include <avrt.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <vector>
 #include <cstring>
 #include <cmath>
@@ -70,6 +72,56 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
     return float4(saturate(r), saturate(g), saturate(b), 1);
 }
 )";
+
+// Catmull-Rom bicubic in 9 bilinear taps, read from the mip level nearest above the output size: sharper than
+// bilinear when enlarging, and with the mip chain no aliasing when shrinking.
+const char *kPsScale = R"(
+Texture2D tex : register(t0);
+SamplerState samp : register(s0);
+cbuffer ScaleCB : register(b2) { float2 tex_size; float lod; float pad; };
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
+    float2 p = uv * tex_size;
+    float2 t1 = floor(p - 0.5) + 0.5;
+    float2 f = p - t1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 t0 = (t1 - 1.0) / tex_size;
+    float2 t3 = (t1 + 2.0) / tex_size;
+    float2 t12 = (t1 + w2 / w12) / tex_size;
+    float3 c = 0;
+    c += tex.SampleLevel(samp, float2(t0.x, t0.y), lod).rgb * w0.x * w0.y;
+    c += tex.SampleLevel(samp, float2(t12.x, t0.y), lod).rgb * w12.x * w0.y;
+    c += tex.SampleLevel(samp, float2(t3.x, t0.y), lod).rgb * w3.x * w0.y;
+    c += tex.SampleLevel(samp, float2(t0.x, t12.y), lod).rgb * w0.x * w12.y;
+    c += tex.SampleLevel(samp, float2(t12.x, t12.y), lod).rgb * w12.x * w12.y;
+    c += tex.SampleLevel(samp, float2(t3.x, t12.y), lod).rgb * w3.x * w12.y;
+    c += tex.SampleLevel(samp, float2(t0.x, t3.y), lod).rgb * w0.x * w3.y;
+    c += tex.SampleLevel(samp, float2(t12.x, t3.y), lod).rgb * w12.x * w3.y;
+    c += tex.SampleLevel(samp, float2(t3.x, t3.y), lod).rgb * w3.x * w3.y;
+    return float4(saturate(c), 1);
+}
+)";
+
+int64_t now_us() {
+    static LARGE_INTEGER freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (int64_t) (now.QuadPart / freq.QuadPart * 1000000 + now.QuadPart % freq.QuadPart * 1000000 / freq.QuadPart);
+}
+
+template <typename T> void release(T *&p) {
+    if (p) {
+        p->Release();
+        p = nullptr;
+    }
+}
 
 struct Vertex {
     float x, y, u, v;
@@ -144,6 +196,13 @@ void VideoPipeline::shutdown() {
         staging_ = nullptr;
         staging_w_ = staging_h_ = 0;
     }
+    release(rgba_srv_);
+    release(rgba_rtv_);
+    release(rgba_);
+    rgba_w_ = rgba_h_ = 0;
+    release(ps_scale_);
+    release(unit_cbuf_);
+    release(scale_cbuf_);
     if (srv_y_) {
         srv_y_->Release();
         srv_y_ = nullptr;
@@ -156,6 +215,7 @@ void VideoPipeline::shutdown() {
         nv12_->Release();
         nv12_ = nullptr;
     }
+    tex_w_ = tex_h_ = 0;
     if (cbuf_) {
         cbuf_->Release();
         cbuf_ = nullptr;
@@ -258,6 +318,11 @@ void VideoPipeline::clear() {
 
 void VideoPipeline::set_cover(bool cover) {
     cover_.store(cover);
+}
+
+void VideoPipeline::set_recorder(Recorder *rec) {
+    std::lock_guard<std::mutex> lock(mu_);
+    recorder_ = rec;
 }
 
 void VideoPipeline::set_first_frame_fn(std::function<void()> fn) {
@@ -389,6 +454,24 @@ bool VideoPipeline::create_pipeline() {
     colord.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     device_->CreateBuffer(&colord, nullptr, &color_cbuf_);
     color_cbuf_dirty_ = true;
+    device_->CreateBuffer(&colord, nullptr, &scale_cbuf_);
+
+    float unit[4] = {1, 1, 0, 0};
+    D3D11_BUFFER_DESC unitd = {};
+    unitd.ByteWidth = 16;
+    unitd.Usage = D3D11_USAGE_IMMUTABLE;
+    unitd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    D3D11_SUBRESOURCE_DATA unitsrd = {unit};
+    device_->CreateBuffer(&unitd, &unitsrd, &unit_cbuf_);
+
+    // The bicubic pass is a quality upgrade; without it frames go straight from NV12 to the screen.
+    ComPtr<ID3DBlob> scaleb;
+    if (SUCCEEDED(D3DCompile(kPsScale, strlen(kPsScale), "ps_scale", nullptr, nullptr, "main", "ps_4_0",
+                             D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &scaleb, &err))) {
+        device_->CreatePixelShader(scaleb->GetBufferPointer(), scaleb->GetBufferSize(), nullptr, &ps_scale_);
+    } else {
+        append_log("bicubic shader unavailable; using bilinear scaling");
+    }
 
     D3D11_SAMPLER_DESC sd = {};
     sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
@@ -442,6 +525,47 @@ bool VideoPipeline::ensure_nv12(int w, int h) {
     return srv_y_ && srv_uv_;
 }
 
+bool VideoPipeline::ensure_rgba(int w, int h) {
+    if (rgba_ && rgba_w_ == w && rgba_h_ == h) {
+        return true;
+    }
+    release(rgba_srv_);
+    release(rgba_rtv_);
+    release(rgba_);
+    rgba_w_ = rgba_h_ = 0;
+    int mips = 1;
+    for (int m = (w > h ? w : h); m > 1; m >>= 1) {
+        ++mips;
+    }
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = (UINT) mips;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    if (FAILED(device_->CreateTexture2D(&td, nullptr, &rgba_))) {
+        return false;
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC rvd = {};
+    rvd.Format = td.Format;
+    rvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    if (FAILED(device_->CreateRenderTargetView(rgba_, &rvd, &rgba_rtv_)) ||
+        FAILED(device_->CreateShaderResourceView(rgba_, nullptr, &rgba_srv_))) {
+        release(rgba_srv_);
+        release(rgba_rtv_);
+        release(rgba_);
+        return false;
+    }
+    rgba_w_ = w;
+    rgba_h_ = h;
+    rgba_mips_ = mips;
+    return true;
+}
+
 bool VideoPipeline::ensure_staging(int w, int h) {
     if (staging_ && staging_w_ == w && staging_h_ == h) {
         return true;
@@ -478,7 +602,9 @@ bool VideoPipeline::decode_init(bool hevc) {
     AVCodecContext *ctx = avcodec_alloc_context3(codec);
     ctx->flags |= AV_CODEC_FLAG_LOW_DELAY;
     ctx->flags2 |= AV_CODEC_FLAG2_FAST | AV_CODEC_FLAG2_SHOW_ALL;
-    ctx->thread_count = 1;
+    // Slice threads only: they add no delay, and keep a software fallback fast enough for 4K HEVC.
+    ctx->thread_type = FF_THREAD_SLICE;
+    ctx->thread_count = 0;
     ctx->pkt_timebase = AVRational{1, 1000000};
     ctx->extra_hw_frames = 8;
 
@@ -534,16 +660,54 @@ void VideoPipeline::submit(const uint8_t *data, int len, uint64_t ntp_ns, bool h
     }
     EncodedPacket pkt;
     pkt.data.assign(data, data + len);
-    pkt.ntp_ns = ntp_ns;
+    pkt.arrival_us = now_us();
+    pkt.remote_clock = ntp_ns != 0;
+    pkt.pts_us = pkt.remote_clock ? (int64_t) (ntp_ns / 1000) : pkt.arrival_us;
     pkt.hevc = hevc;
+    bool overflow = false;
     {
         std::lock_guard<std::mutex> qlock(q_mu_);
         if (q_.size() >= kMaxQueued) {
-            q_.pop_front();
+            // Seconds behind: the decoder has stalled. Start over rather than play stale video.
+            q_.clear();
+            overflow = true;
         }
         q_.push_back(std::move(pkt));
     }
+    if (overflow) {
+        append_log("video backlog overflow; dropped queued packets");
+    }
     q_cv_.notify_one();
+}
+
+void VideoPipeline::pace(const EncodedPacket &pkt) {
+    if (!smooth_.load() || !pkt.remote_clock) {
+        offset_valid_ = false;
+        return;
+    }
+    // Map the sender clock onto ours using the least-delayed packet seen: that one met no queueing on the
+    // network, so offset + a fixed cushion is when every frame can be shown on an even beat.
+    constexpr int64_t kCushionUs = 60000;
+    constexpr int64_t kDecodeBudgetUs = 3000;
+    int64_t d = pkt.arrival_us - pkt.pts_us;
+    if (!offset_valid_ || d < offset_us_ || d - offset_us_ > 1000000) {
+        offset_us_ = d;
+        offset_valid_ = true;
+    } else {
+        offset_us_ += 2; // follow slow drift between the two clocks (~120 us/s)
+    }
+    int64_t due = pkt.pts_us + offset_us_ + kCushionUs - kDecodeBudgetUs;
+    for (;;) {
+        int64_t wait = due - now_us();
+        if (wait <= 0 || wait > 500000 || !worker_run_) {
+            return;
+        }
+        if (wait > 1500) {
+            Sleep((DWORD) ((wait - 1000) / 1000 < 10 ? (wait - 1000) / 1000 : 10));
+        } else {
+            SwitchToThread();
+        }
+    }
 }
 
 void VideoPipeline::decode_loop() {
@@ -555,6 +719,7 @@ void VideoPipeline::decode_loop() {
     }
     while (worker_run_) {
         EncodedPacket pkt;
+        bool more = false;
         {
             std::unique_lock<std::mutex> qlock(q_mu_);
             q_cv_.wait(qlock, [this] { return !q_.empty() || !worker_run_; });
@@ -563,15 +728,24 @@ void VideoPipeline::decode_loop() {
             }
             pkt = std::move(q_.front());
             q_.pop_front();
+            more = !q_.empty();
         }
-        decode_packet(pkt);
+        pace(pkt);
+        if (smooth_.load() && more) {
+            std::lock_guard<std::mutex> qlock(q_mu_);
+            // Pacing waited for this frame; only skip it if the next one is already due too.
+            more = !q_.empty() && q_.front().arrival_us + 100000 < now_us();
+        }
+        // When packets piled up (a Wi-Fi burst), decode all of them but show only the newest: catching up
+        // at once instead of playing the backlog slowly is what keeps latency from building up.
+        decode_packet(pkt, !more);
     }
     if (mmcss) {
         AvRevertMmThreadCharacteristics(mmcss);
     }
 }
 
-void VideoPipeline::decode_packet(const EncodedPacket &pkt) {
+void VideoPipeline::decode_packet(const EncodedPacket &pkt, bool present) {
     std::lock_guard<std::mutex> lock(mu_);
     if (!device_ || pkt.data.empty()) {
         return;
@@ -592,6 +766,7 @@ void VideoPipeline::decode_packet(const EncodedPacket &pkt) {
         return;
     }
     memcpy(avpkt->data, data, (size_t) len);
+    avpkt->pts = avpkt->dts = pkt.pts_us;
     int send = avcodec_send_packet(ctx, avpkt);
     if (send < 0 && send != AVERROR(EAGAIN)) {
         decode_init(hevc);
@@ -602,6 +777,7 @@ void VideoPipeline::decode_packet(const EncodedPacket &pkt) {
             return;
         }
         memcpy(avpkt->data, data, (size_t) len);
+        avpkt->pts = avpkt->dts = pkt.pts_us;
         send = avcodec_send_packet(ctx, avpkt);
         if (send < 0 && send != AVERROR(EAGAIN)) {
             char es[64];
@@ -648,7 +824,9 @@ void VideoPipeline::decode_packet(const EncodedPacket &pkt) {
                 av_frame_unref(frame);
                 continue;
             }
-            ctx_->CopySubresourceRegion(nv12_, 0, 0, 0, 0, tex, (UINT) index, nullptr);
+            // Decoder surfaces are padded (1080 -> 1088 and so on); copy only the visible picture.
+            D3D11_BOX box = {0, 0, 0, (UINT) w, (UINT) h, 1};
+            ctx_->CopySubresourceRegion(nv12_, 0, 0, 0, 0, tex, (UINT) index, &box);
         } else if (frame->format == AV_PIX_FMT_NV12) {
             if (ensure_staging(w, h)) {
                 D3D11_MAPPED_SUBRESOURCE map = {};
@@ -667,8 +845,13 @@ void VideoPipeline::decode_packet(const EncodedPacket &pkt) {
         } else if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P) {
             upload_yuv420(frame->data[0], frame->linesize[0], frame->data[1], frame->data[2], frame->linesize[1], w, h);
         }
+        if (recorder_ && recorder_->active()) {
+            recorder_->on_video_frame(device_, ctx_, frame, w, h);
+        }
         bool first = !has_frame_.exchange(true);
-        present_nv12();
+        if (present || first) {
+            present_nv12();
+        }
         av_frame_unref(frame);
         if (first && first_frame_fn_) {
             first_frame_fn_();
@@ -781,17 +964,66 @@ void VideoPipeline::present_nv12() {
     ctx_->VSSetShader(vs_, nullptr, 0);
     ctx_->PSSetShader(ps_, nullptr, 0);
     ctx_->PSSetSamplers(0, 1, &sampler_);
-    ID3D11ShaderResourceView *srvs[2] = {srv_y_, srv_uv_};
-    ctx_->PSSetShaderResources(0, 2, srvs);
     ctx_->RSSetState(raster_);
-    ctx_->Draw(4, 0);
+    ID3D11ShaderResourceView *srvs[2] = {srv_y_, srv_uv_};
     ID3D11ShaderResourceView *none[2] = {};
-    ctx_->PSSetShaderResources(0, 2, none);
 
-    HRESULT hr = swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    if (hr == DXGI_ERROR_INVALID_CALL && tearing_) {
-        tearing_ = false;
-        hr = swapchain_->Present(0, 0);
+    if (ps_scale_ && unit_cbuf_ && scale_cbuf_ && tex_w_ > 0 && tex_h_ > 0 && ensure_rgba(tex_w_, tex_h_)) {
+        // Pass 1: NV12 -> RGB at the stream's own resolution, pixel for pixel.
+        D3D11_VIEWPORT svp = {};
+        svp.Width = (float) tex_w_;
+        svp.Height = (float) tex_h_;
+        svp.MaxDepth = 1;
+        ctx_->RSSetViewports(1, &svp);
+        ctx_->OMSetRenderTargets(1, &rgba_rtv_, nullptr);
+        ctx_->VSSetConstantBuffers(0, 1, &unit_cbuf_);
+        ctx_->PSSetShaderResources(0, 2, srvs);
+        ctx_->Draw(4, 0);
+        ctx_->PSSetShaderResources(0, 2, none);
+
+        // Pass 2: RGB -> window, bicubic from the mip level just above the on-screen size.
+        float scale = (std::min)((float) cw * sx / (float) tex_w_, (float) ch * sy / (float) tex_h_);
+        int lod = 0;
+        if (scale < 1.0f) {
+            lod = (int) std::floor(std::log2(1.0f / scale));
+            lod = (std::min)(lod, rgba_mips_ - 1);
+        }
+        if (lod > 0) {
+            ctx_->GenerateMips(rgba_srv_);
+        }
+        D3D11_MAPPED_SUBRESOURCE map = {};
+        if (SUCCEEDED(ctx_->Map(scale_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+            float *f = (float *) map.pData;
+            f[0] = (float) (std::max)(1, tex_w_ >> lod);
+            f[1] = (float) (std::max)(1, tex_h_ >> lod);
+            f[2] = (float) lod;
+            f[3] = 0;
+            ctx_->Unmap(scale_cbuf_, 0);
+        }
+        ctx_->RSSetViewports(1, &vp);
+        ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
+        ctx_->VSSetConstantBuffers(0, 1, &cbuf_);
+        ctx_->PSSetShader(ps_scale_, nullptr, 0);
+        ctx_->PSSetConstantBuffers(2, 1, &scale_cbuf_);
+        ctx_->PSSetShaderResources(0, 1, &rgba_srv_);
+        ctx_->Draw(4, 0);
+        ctx_->PSSetShaderResources(0, 1, none);
+    } else {
+        ctx_->PSSetShaderResources(0, 2, srvs);
+        ctx_->Draw(4, 0);
+        ctx_->PSSetShaderResources(0, 2, none);
+    }
+
+    // Smooth mode lines frames up with the display's refresh; otherwise show them the instant they're ready.
+    HRESULT hr;
+    if (smooth_.load()) {
+        hr = swapchain_->Present(1, 0);
+    } else {
+        hr = swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        if (hr == DXGI_ERROR_INVALID_CALL && tearing_) {
+            tearing_ = false;
+            hr = swapchain_->Present(0, 0);
+        }
     }
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         append_log("DXGI device lost during present");

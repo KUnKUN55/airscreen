@@ -3,6 +3,7 @@
 #include "settings.h"
 #include "video.h"
 #include "audio.h"
+#include "recorder.h"
 
 #include <atomic>
 #include <functional>
@@ -23,6 +24,7 @@ enum class UiEvent {
     VideoSize,
     VideoReady,
     ClientName,
+    RecordingStopped, // message: error text, empty when the clip closed cleanly
 };
 
 class Receiver {
@@ -37,8 +39,11 @@ public:
     bool rename(const std::string &name);
     bool set_require_pin(bool on);
     void set_always_on_top_flag(bool on) { (void) on; }
+    bool set_high_quality(bool on);
+    void set_smooth(bool on);
 
     VideoPipeline &video() { return video_; }
+    Recorder &recorder() { return recorder_; }
     bool connected() const { return connected_; }
     std::string pin() const;
     std::string client_name() const;
@@ -64,6 +69,8 @@ private:
     bool start_raop();
     void apply_features();
     void teardown_session();
+    int display_width() const;
+    int display_height() const;
     std::vector<char> hw_bytes_;
     std::atomic<int> open_conns_{0};
 
@@ -82,6 +89,7 @@ private:
     void *raop_ = nullptr;
     unsigned short raop_port_ = 0;
 
+    Recorder recorder_; // declared before the pipelines so it outlives their worker threads
     VideoPipeline video_;
     AudioPipeline audio_;
     std::mutex pin_mu_;

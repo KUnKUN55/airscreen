@@ -16,6 +16,8 @@ struct Settings {
     int height = 1080;
     int refresh_hz = 60;
     int max_fps = 60;
+    bool high_quality = true; // advertise a 4K display and accept HEVC, so iOS mirrors at native sharpness
+    bool smooth = false;      // present on vsync with a tiny buffer instead of the instant the frame decodes
     int win_x = 0, win_y = 0, win_w = 0, win_h = 0; // 0 size = default placement
 };
 
