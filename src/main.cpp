@@ -17,6 +17,7 @@
 #include <dbghelp.h>
 #include <timeapi.h>
 #include <string>
+#include <vector>
 #include <cmath>
 
 #pragma comment(lib, "comctl32.lib")
@@ -65,6 +66,7 @@ struct App {
     std::wstring overlay_detail;
     bool connected = false;
     bool recording = false;
+    std::vector<airscreen::MicCapture::Device> mics; // as listed when the menu last opened
     HICON icon = nullptr;
     HICON icon_sm = nullptr;
 
@@ -106,7 +108,8 @@ void update_title(App *app) {
     if (app->recording) {
         int s = (int) app->receiver.recorder().seconds();
         wchar_t rec[48];
-        swprintf_s(rec, L"● REC %02d:%02d:%02d - ", s / 3600, s / 60 % 60, s % 60);
+        swprintf_s(rec, L"● REC %02d:%02d:%02d%s - ", s / 3600, s / 60 % 60, s % 60,
+                   app->receiver.recorder().mic_running() ? L" + MIC" : L"");
         t = rec;
     }
     t += L"AirScreen - " + app->utf16(app->settings.name);
@@ -181,6 +184,55 @@ void toggle_recording(App *app) {
     app->recording = true;
     SetTimer(app->hwnd, kTimerRec, 500, nullptr);
     update_title(app);
+    if (!rec.mic_error().empty()) {
+        tray_balloon(app, L"Recording without the microphone", app->utf16(rec.mic_error()));
+    }
+}
+
+constexpr int kMicGains[] = {50, 100, 150, 200, 300};
+
+// Pushes the mic settings to the recorder; mid-clip that switches the mic on, off or to another device.
+void apply_mic(App *app) {
+    auto &rec = app->receiver.recorder();
+    bool ok = rec.set_mic(app->settings.mic_enabled, app->utf16(app->settings.mic_device),
+                          app->settings.mic_gain_pct / 100.0f);
+    if (app->recording) {
+        if (!ok) {
+            tray_balloon(app, L"Microphone unavailable", app->utf16(rec.mic_error()));
+        }
+        update_title(app);
+    }
+}
+
+void toggle_mic(App *app) {
+    app->settings.mic_enabled = !app->settings.mic_enabled;
+    airscreen::save_settings(app->settings);
+    apply_mic(app);
+    if (app->recording && app->receiver.recorder().mic_error().empty()) {
+        tray_balloon(app, app->settings.mic_enabled ? L"Microphone on" : L"Microphone off",
+                     L"Ctrl+M switches it during a recording");
+    }
+}
+
+HMENU build_mic_menu(App *app) {
+    app->mics = airscreen::MicCapture::list_devices();
+    HMENU m = CreatePopupMenu();
+    const auto &s = app->settings;
+    AppendMenuW(m, MF_STRING | (!s.mic_enabled ? MF_CHECKED : 0), IDM_MIC_OFF, L"Off");
+    AppendMenuW(m, MF_STRING | (s.mic_enabled && s.mic_device.empty() ? MF_CHECKED : 0), IDM_MIC_DEFAULT,
+                L"Windows default microphone");
+    for (size_t i = 0; i < app->mics.size() && i < 99; ++i) {
+        bool on = s.mic_enabled && app->utf16(s.mic_device) == app->mics[i].id;
+        AppendMenuW(m, MF_STRING | (on ? MF_CHECKED : 0), IDM_MIC_DEV_BASE + (UINT) i, app->mics[i].name.c_str());
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    for (size_t i = 0; i < sizeof(kMicGains) / sizeof(kMicGains[0]); ++i) {
+        wchar_t label[32];
+        swprintf_s(label, L"Mic volume %d%%", kMicGains[i]);
+        AppendMenuW(m, MF_STRING | (s.mic_gain_pct == kMicGains[i] ? MF_CHECKED : 0), IDM_MIC_GAIN_BASE + (UINT) i,
+                    label);
+    }
+    return m;
 }
 
 void apply_video_fill(App *app) {
@@ -367,6 +419,8 @@ void popup_settings_menu(App *app, POINT screen_pt, bool tray) {
     }
     AppendMenuW(m, MF_STRING | (app->mirroring || app->recording ? 0 : MF_GRAYED), IDM_REC_TOGGLE,
                 app->recording ? L"Stop recording\tCtrl+R" : L"Record clip\tCtrl+R");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR) build_mic_menu(app),
+                app->settings.mic_enabled ? L"Microphone in clips (on)\tCtrl+M" : L"Microphone in clips (off)\tCtrl+M");
     AppendMenuW(m, MF_STRING, IDM_REC_FOLDER, L"Open recordings folder");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (app->settings.high_quality ? MF_CHECKED : 0), IDM_QUALITY,
@@ -457,6 +511,15 @@ void handle_tray_cmd(App *app, UINT id) {
     case IDM_REC_TOGGLE:
         toggle_recording(app);
         break;
+    case IDM_MIC_OFF:
+    case IDM_MIC_DEFAULT:
+        app->settings.mic_enabled = id == IDM_MIC_DEFAULT;
+        if (id == IDM_MIC_DEFAULT) {
+            app->settings.mic_device.clear();
+        }
+        airscreen::save_settings(app->settings);
+        apply_mic(app);
+        break;
     case IDM_REC_FOLDER: {
         auto dir = recordings_dir();
         ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -492,6 +555,22 @@ void handle_tray_cmd(App *app, UINT id) {
     case IDM_TRAY_EXIT:
         DestroyWindow(app->hwnd);
         return;
+    default:
+        if (id >= IDM_MIC_DEV_BASE && id < IDM_MIC_DEV_BASE + app->mics.size()) {
+            const std::wstring &dev = app->mics[id - IDM_MIC_DEV_BASE].id;
+            int n = WideCharToMultiByte(CP_UTF8, 0, dev.c_str(), (int) dev.size(), nullptr, 0, nullptr, nullptr);
+            std::string utf8(n, 0);
+            WideCharToMultiByte(CP_UTF8, 0, dev.c_str(), (int) dev.size(), utf8.data(), n, nullptr, nullptr);
+            app->settings.mic_device = utf8;
+            app->settings.mic_enabled = true;
+            airscreen::save_settings(app->settings);
+            apply_mic(app);
+        } else if (id >= IDM_MIC_GAIN_BASE && id < IDM_MIC_GAIN_BASE + sizeof(kMicGains) / sizeof(kMicGains[0])) {
+            app->settings.mic_gain_pct = kMicGains[id - IDM_MIC_GAIN_BASE];
+            airscreen::save_settings(app->settings);
+            apply_mic(app);
+        }
+        break;
     }
     if (app->hwnd) {
         InvalidateRect(app->hwnd, nullptr, FALSE);
@@ -767,6 +846,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             do_rename(app);
         } else if (wparam == VK_F9 || (wparam == 'R' && (GetKeyState(VK_CONTROL) & 0x8000))) {
             toggle_recording(app);
+        } else if (wparam == 'M' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            toggle_mic(app);
         } else if (wparam == VK_ESCAPE && app->fullscreen) {
             set_fullscreen(app, false);
         }
@@ -1058,6 +1139,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
     } else {
         app.overlay_status = L"Waiting for iPhone";
         apply_video_fill(&app);
+        apply_mic(&app);
         InvalidateRect(app.hwnd, nullptr, FALSE);
     }
 

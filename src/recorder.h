@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mic.h"
+
 #include <atomic>
 #include <climits>
 #include <condition_variable>
@@ -45,6 +47,13 @@ public:
     // Audio decode thread.
     void on_audio_pcm(const int16_t *pcm, int frames, int channels, int rate, uint64_t ntp_ns);
 
+    // Microphone mixed into the clip's audio, e.g. to narrate a tutorial. Changing the device or turning it
+    // on/off mid-clip restarts capture; gain (1.0 = as captured) applies immediately. Returns false if the
+    // mic couldn't be opened, with the reason in mic_error(); the clip keeps recording without it.
+    bool set_mic(bool enabled, const std::wstring &device_id, float gain);
+    bool mic_running() const { return mic_.running(); }
+    std::string mic_error() const;
+
 private:
     struct Item {
         bool video = false;
@@ -53,20 +62,26 @@ private:
         int h = 0;
         ID3D11Texture2D *staging = nullptr; // GPU frames: owned reference
         void *sw_frame = nullptr;           // CPU-decoded frames: AVFrame clone
-        std::vector<int16_t> pcm;
+        std::vector<int16_t> pcm; // iPhone audio
         int channels = 0;
         int rate = 0;
+        bool mic = false;
+        std::vector<float> fpcm; // mic: 48 kHz stereo float, gain applied
     };
     struct Out;
 
     void writer_loop();
     bool handle_video(Item &it);
     void handle_audio(Item &it);
+    void mix_in(int src, const float *pcm, int frames, int64_t at, bool timed);
+    void pump_mix(bool flush, int64_t limit = INT64_MAX);
+    int64_t watermark() const;
+    void on_mic_pcm(const float *pcm, int frames, int64_t local_time_us);
+    bool restart_mic_locked();
     bool open_output(int w, int h);
     void close_output();
     bool open_video_encoder(int w, int h);
     bool open_audio_encoder();
-    void encode_audio_fifo(bool flush);
     bool write_packets(void *codec_ctx, void *stream, bool flush);
     void release_item(Item &it);
     ID3D11Texture2D *take_staging(ID3D11Device *device, int w, int h);
@@ -88,6 +103,16 @@ private:
     // Shared between the decode thread (producer) and the writer: the clip's zero point on the sender clock.
     std::atomic<int64_t> base_us_{INT64_MIN};
     std::atomic<int64_t> last_video_us_{0};
+    std::atomic<int64_t> offset_us_{INT64_MIN}; // local clock minus sender clock, from the video frames
+    int64_t win_start_ = 0;                     // windowed minimum behind offset_us_; decode thread only
+    int64_t cur_min_ = 0;
+    int64_t prev_min_ = 0;
+
+    MicCapture mic_;
+    bool mic_enabled_ = false; // guarded by life_mu_
+    std::wstring mic_device_;  // guarded by life_mu_
+    std::string mic_error_;    // guarded by info_mu_
+    std::atomic<float> mic_gain_{1.0f};
 
     std::mutex pool_mu_;
     std::vector<ID3D11Texture2D *> pool_;

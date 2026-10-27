@@ -140,6 +140,13 @@ Settings load_settings() {
             s.high_quality = (val == "1" || val == "true");
         } else if (key == "Smooth") {
             s.smooth = (val == "1" || val == "true");
+        } else if (key == "MicEnabled") {
+            s.mic_enabled = (val == "1" || val == "true");
+        } else if (key == "MicDevice") {
+            s.mic_device = val;
+        } else if (key == "MicGain") {
+            int g = atoi(val.c_str());
+            s.mic_gain_pct = g > 0 && g <= 400 ? g : s.mic_gain_pct;
         } else if (key == "Window") {
             sscanf(val.c_str(), "%d,%d,%d,%d", &s.win_x, &s.win_y, &s.win_w, &s.win_h);
         }
@@ -160,6 +167,9 @@ void save_settings(const Settings &s) {
     out << "MaxFps=" << s.max_fps << "\n";
     out << "HighQuality=" << (s.high_quality ? 1 : 0) << "\n";
     out << "Smooth=" << (s.smooth ? 1 : 0) << "\n";
+    out << "MicEnabled=" << (s.mic_enabled ? 1 : 0) << "\n";
+    out << "MicDevice=" << s.mic_device << "\n";
+    out << "MicGain=" << s.mic_gain_pct << "\n";
     out << "Window=" << s.win_x << "," << s.win_y << "," << s.win_w << "," << s.win_h << "\n";
 }
 

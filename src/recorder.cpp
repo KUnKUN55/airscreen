@@ -1,6 +1,8 @@
 #include "recorder.h"
 #include "settings.h"
 
+#include <chrono>
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -14,7 +16,6 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavutil/audio_fifo.h>
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
@@ -33,6 +34,14 @@ constexpr int kAudioRate = 48000;
 constexpr int kAudioChannels = 2;
 constexpr int kVideoTimebase = 90000;
 constexpr int kGopSeconds = 2;
+// How long the mix waits for late audio before encoding a stretch. iPhone audio and the mic both arrive well
+// within this; it only delays the audio track's encoding, not what's on screen.
+constexpr int64_t kMixLatencyUs = 300000;
+// A source quiet for this long (the iPhone stops sending audio when nothing plays) no longer holds the mix.
+constexpr int64_t kSourceIdleUs = 500000;
+// The clock offset is the smallest delay seen over the last one to two windows, so it follows the network
+// getting slower within a few seconds instead of clinging to the best case forever.
+constexpr int64_t kOffsetWindowUs = 2000000;
 
 void rlog(const char *fmt, ...) {
     char buf[384];
@@ -151,9 +160,11 @@ struct Recorder::Out {
     SwrContext *swr = nullptr;
     int swr_rate = 0;
     int swr_ch = 0;
-    AVAudioFifo *fifo = nullptr;
-    int64_t a_next = 0; // pts (in samples) of the first sample waiting in the fifo
-    bool a_anchored = false;
+    // Audio mix: interleaved stereo float, mix[0] being sample mix_pos (48 kHz, from the part's start).
+    std::vector<float> mix;
+    int64_t mix_pos = 0;
+    int64_t src_next[2] = {INT64_MIN, INT64_MIN}; // where each source (0 iPhone, 1 mic) continues
+    int64_t src_last_local[2] = {0, 0};           // local time of each source's latest chunk
     int w = 0;
     int h = 0;
     int64_t part_base_us = 0;
@@ -189,16 +200,21 @@ bool Recorder::start(const std::wstring &path) {
     }
     base_us_ = INT64_MIN;
     last_video_us_ = 0;
+    offset_us_ = INT64_MIN;
+    win_start_ = 0;
     dropped_ = 0;
     run_ = true;
     active_ = true;
     thread_ = std::thread([this] { writer_loop(); });
     rlog("armed: %s", utf8(path).c_str());
+    // A mic that won't open doesn't stop the clip; the UI reports mic_error().
+    restart_mic_locked();
     return true;
 }
 
 void Recorder::stop() {
     std::lock_guard<std::mutex> life(life_mu_);
+    mic_.stop();
     if (!thread_.joinable()) {
         active_ = false;
         return;
@@ -370,6 +386,18 @@ void Recorder::on_video_frame(ID3D11Device *device, ID3D11DeviceContext *ctx, co
     int64_t expect = INT64_MIN;
     base_us_.compare_exchange_strong(expect, pts);
     last_video_us_ = pts;
+    // Track local clock minus sender clock using the least-delayed frame of the last few seconds. The mic is
+    // timed on the local clock; this puts it on the same timeline as the video.
+    int64_t now = local_us();
+    int64_t d = now - pts;
+    if (win_start_ == 0 || now - win_start_ >= kOffsetWindowUs) {
+        prev_min_ = win_start_ == 0 ? d : cur_min_;
+        cur_min_ = d;
+        win_start_ = now;
+    } else {
+        cur_min_ = (std::min)(cur_min_, d);
+    }
+    offset_us_ = (std::min)(cur_min_, prev_min_);
     {
         std::lock_guard<std::mutex> lock(q_mu_);
         ++queued_video_;
@@ -401,28 +429,94 @@ void Recorder::on_audio_pcm(const int16_t *pcm, int frames, int channels, int ra
     q_cv_.notify_one();
 }
 
+void Recorder::on_mic_pcm(const float *pcm, int frames, int64_t local_time_us) {
+    int64_t off = offset_us_.load();
+    if (!active_.load() || frames <= 0 || off == INT64_MIN) {
+        return; // nothing to line the mic up with until the first picture arrives
+    }
+    float gain = mic_gain_.load();
+    Item it;
+    it.mic = true;
+    it.pts_us = local_time_us - off;
+    it.fpcm.resize((size_t) frames * MicCapture::kChannels);
+    for (size_t i = 0; i < it.fpcm.size(); ++i) {
+        it.fpcm[i] = pcm[i] * gain;
+    }
+    {
+        std::lock_guard<std::mutex> lock(q_mu_);
+        if (!run_ || q_.size() > 512) {
+            return;
+        }
+        q_.push_back(std::move(it));
+    }
+    q_cv_.notify_one();
+}
+
+bool Recorder::set_mic(bool enabled, const std::wstring &device_id, float gain) {
+    mic_gain_ = gain; // takes effect on the next chunk, no restart needed
+    std::lock_guard<std::mutex> life(life_mu_);
+    bool changed = enabled != mic_enabled_ || device_id != mic_device_;
+    mic_enabled_ = enabled;
+    mic_device_ = device_id;
+    if (!changed || !thread_.joinable()) {
+        return true; // otherwise applied when the next clip starts
+    }
+    return restart_mic_locked();
+}
+
+bool Recorder::restart_mic_locked() {
+    mic_.stop();
+    std::string err;
+    if (mic_enabled_ &&
+        !mic_.start(mic_device_, [this](const float *pcm, int frames, int64_t at) { on_mic_pcm(pcm, frames, at); })) {
+        err = mic_.error();
+    }
+    std::lock_guard<std::mutex> lock(info_mu_);
+    mic_error_ = err;
+    return err.empty();
+}
+
+std::string Recorder::mic_error() const {
+    std::lock_guard<std::mutex> lock(info_mu_);
+    return mic_error_;
+}
+
 void Recorder::writer_loop() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     bool failed = false;
     for (;;) {
         Item it;
+        bool have = false;
         {
             std::unique_lock<std::mutex> lock(q_mu_);
-            q_cv_.wait(lock, [this] { return !q_.empty() || !run_; });
-            if (q_.empty()) {
+            // Wake at least every 20 ms so the audio mix keeps flowing even when nothing arrives.
+            q_cv_.wait_for(lock, std::chrono::milliseconds(20), [this] { return !q_.empty() || !run_; });
+            if (q_.empty() && !run_) {
                 break; // stopping, and everything queued has been written
             }
-            it = std::move(q_.front());
-            q_.pop_front();
-            if (it.video) {
-                --queued_video_;
+            if (!q_.empty()) {
+                it = std::move(q_.front());
+                q_.pop_front();
+                have = true;
+                if (it.video) {
+                    --queued_video_;
+                }
             }
+        }
+        if (!have) {
+            if (out_ && !failed) {
+                pump_mix(false);
+            }
+            continue;
         }
         if (!failed) {
             if (it.video) {
                 failed = !handle_video(it);
             } else if (out_) {
                 handle_audio(it);
+            }
+            if (out_ && !failed) {
+                pump_mix(false);
             }
             if (failed) {
                 active_ = false; // the UI notices and reports last_error()
@@ -443,8 +537,19 @@ void Recorder::writer_loop() {
 
 bool Recorder::handle_video(Item &it) {
     if (!out_ || out_->w != it.w || out_->h != it.h) {
+        std::vector<float> carry;
+        int64_t carry_at = 0;
+        int64_t carry_next[2] = {INT64_MIN, INT64_MIN};
         if (out_) {
-            // The phone rotated: finish this file and carry on in the next one.
+            // The phone rotated: finish this file and carry on in the next one. Audio already mixed past the
+            // cut belongs to the new file, so move it across rather than leave it trailing in the old one.
+            int64_t cut = (it.pts_us - out_->part_base_us) * kAudioRate / 1000000;
+            pump_mix(true, cut);
+            carry_at = (std::max)(out_->mix_pos - cut, (int64_t) 0);
+            carry.swap(out_->mix);
+            for (int s = 0; s < 2; ++s) {
+                carry_next[s] = out_->src_next[s] == INT64_MIN ? INT64_MIN : out_->src_next[s] - cut;
+            }
             close_output();
             int part;
             {
@@ -460,6 +565,12 @@ bool Recorder::handle_video(Item &it) {
             return false;
         }
         out_->part_base_us = it.pts_us;
+        if (!carry.empty()) {
+            out_->mix.assign((size_t) carry_at * kAudioChannels, 0.0f);
+            out_->mix.insert(out_->mix.end(), carry.begin(), carry.end());
+            out_->src_next[0] = carry_next[0];
+            out_->src_next[1] = carry_next[1];
+        }
     }
     Out &o = *out_;
 
@@ -530,9 +641,71 @@ bool Recorder::handle_video(Item &it) {
     return write_packets(o.venc, o.vst, false);
 }
 
+// Adds stereo float samples into the mix at sample position `at` (relative to the part's start). Each source
+// is kept continuous: positions within 50 ms of where its previous chunk ended are treated as jitter, so the
+// audio never gets tiny gaps or overlaps (clicks); a bigger jump (a pause in the sound) is honoured.
+void Recorder::mix_in(int src, const float *pcm, int frames, int64_t at, bool timed) {
+    Out &o = *out_;
+    int64_t &next = o.src_next[src];
+    if (!timed) {
+        at = next != INT64_MIN ? next : watermark();
+    } else if (next != INT64_MIN && std::llabs(at - next) < kAudioRate / 20) {
+        at = next;
+    }
+    next = at + frames;
+    o.src_last_local[src] = local_us();
+    if (at < o.mix_pos) {
+        int64_t skip = o.mix_pos - at;
+        if (skip >= frames) {
+            return; // arrived after that stretch was already encoded
+        }
+        pcm += skip * kAudioChannels;
+        frames -= (int) skip;
+        at = o.mix_pos;
+    }
+    if (at - o.mix_pos > (int64_t) kAudioRate * 10) {
+        return; // nonsense timestamp; don't grow the buffer by minutes
+    }
+    size_t start = (size_t) (at - o.mix_pos) * kAudioChannels;
+    size_t need = start + (size_t) frames * kAudioChannels;
+    if (o.mix.size() < need) {
+        o.mix.resize(need, 0.0f);
+    }
+    float *dst = o.mix.data() + start;
+    for (size_t i = 0, n = (size_t) frames * kAudioChannels; i < n; ++i) {
+        dst[i] += pcm[i];
+    }
+}
+
+// Sample position up to which every source has had its chance to arrive: the sender's "now" less a grace
+// period, and never past where a source that is still delivering has got to. Without that second bound, a
+// clock estimate that runs ahead (the network got slower and stayed slow) would encode silence over audio
+// that was simply late.
+int64_t Recorder::watermark() const {
+    int64_t offset = offset_us_.load();
+    if (offset == INT64_MIN || !out_) {
+        return 0;
+    }
+    const Out &o = *out_;
+    int64_t now = local_us();
+    int64_t wm = (now - offset - o.part_base_us - kMixLatencyUs) * kAudioRate / 1000000;
+    for (int s = 0; s < 2; ++s) {
+        if (o.src_last_local[s] && now - o.src_last_local[s] < kSourceIdleUs && o.src_next[s] != INT64_MIN) {
+            wm = (std::min)(wm, o.src_next[s]);
+        }
+    }
+    return wm;
+}
+
 void Recorder::handle_audio(Item &it) {
     Out &o = *out_;
-    if (!o.aenc || !o.fifo) {
+    if (!o.aenc) {
+        return;
+    }
+    if (it.mic) {
+        int frames = (int) (it.fpcm.size() / kAudioChannels);
+        int64_t at = (it.pts_us - o.part_base_us) * kAudioRate / 1000000;
+        mix_in(1, it.fpcm.data(), frames, at, true);
         return;
     }
     if (!o.swr || o.swr_rate != it.rate || o.swr_ch != it.channels) {
@@ -540,7 +713,7 @@ void Recorder::handle_audio(Item &it) {
         AVChannelLayout in_layout, out_layout;
         av_channel_layout_default(&in_layout, it.channels);
         av_channel_layout_default(&out_layout, kAudioChannels);
-        int err = swr_alloc_set_opts2(&o.swr, &out_layout, AV_SAMPLE_FMT_FLTP, kAudioRate, &in_layout,
+        int err = swr_alloc_set_opts2(&o.swr, &out_layout, AV_SAMPLE_FMT_FLT, kAudioRate, &in_layout,
                                       AV_SAMPLE_FMT_S16, it.rate, 0, nullptr);
         av_channel_layout_uninit(&in_layout);
         av_channel_layout_uninit(&out_layout);
@@ -556,53 +729,32 @@ void Recorder::handle_audio(Item &it) {
     if (out_cap <= 0) {
         return;
     }
-    uint8_t **conv = nullptr;
-    if (av_samples_alloc_array_and_samples(&conv, nullptr, kAudioChannels, out_cap, AV_SAMPLE_FMT_FLTP, 0) < 0) {
-        return;
-    }
+    std::vector<float> conv((size_t) out_cap * kAudioChannels);
+    uint8_t *dst = (uint8_t *) conv.data();
     const uint8_t *src = (const uint8_t *) it.pcm.data();
-    int got = swr_convert(o.swr, conv, out_cap, &src, in_frames);
-
+    int got = swr_convert(o.swr, &dst, out_cap, &src, in_frames);
     if (got > 0) {
-        // Place the samples by the sender's clock, which video uses too, so the two stay in sync over a long
-        // clip. Small differences are jitter and are ignored; a real gap (audio paused) is filled with silence.
-        int64_t fifo_end = o.a_next + av_audio_fifo_size(o.fifo);
-        if (it.pts_us != INT64_MIN) {
-            int64_t at = (it.pts_us - o.part_base_us) * kAudioRate / 1000000;
-            if (!o.a_anchored) {
-                o.a_next = (std::max)(at, (int64_t) 0);
-                o.a_anchored = true;
-            } else if (at - fifo_end > kAudioRate / 20) {
-                int64_t gap = at - fifo_end;
-                if (gap > (int64_t) kAudioRate * 10) {
-                    // Long silence: close out what's buffered and restart the track at the new position.
-                    encode_audio_fifo(true);
-                    o.a_next = at;
-                } else {
-                    std::vector<float> zeros((size_t) gap, 0.0f);
-                    void *planes[kAudioChannels];
-                    for (auto &p : planes) {
-                        p = zeros.data();
-                    }
-                    av_audio_fifo_write(o.fifo, planes, (int) gap);
-                }
-            }
-        } else if (!o.a_anchored) {
-            o.a_next = (std::max)((last_video_us_.load() - o.part_base_us) * kAudioRate / 1000000, (int64_t) 0);
-            o.a_anchored = true;
-        }
-        av_audio_fifo_write(o.fifo, (void **) conv, got);
-        encode_audio_fifo(false);
+        bool timed = it.pts_us != INT64_MIN;
+        int64_t at = timed ? (it.pts_us - o.part_base_us) * kAudioRate / 1000000 : 0;
+        mix_in(0, conv.data(), got, at, timed);
     }
-    av_freep(&conv[0]);
-    av_freep(&conv);
 }
 
-void Recorder::encode_audio_fifo(bool flush) {
+// Encodes the mix up to the watermark (or, when the file is closing, everything buffered). Stretches no
+// source covered become silence, so the track is continuous and the mic keeps recording while the iPhone
+// is quiet.
+void Recorder::pump_mix(bool flush, int64_t limit) {
     Out &o = *out_;
-    int fs = o.aenc->frame_size > 0 ? o.aenc->frame_size : 1024;
-    while (av_audio_fifo_size(o.fifo) >= fs || (flush && av_audio_fifo_size(o.fifo) > 0)) {
-        int n = (std::min)(fs, av_audio_fifo_size(o.fifo));
+    if (!o.aenc) {
+        return;
+    }
+    const int fs = o.aenc->frame_size > 0 ? o.aenc->frame_size : 1024;
+    int64_t end = flush ? o.mix_pos + (int64_t) (o.mix.size() / kAudioChannels) : watermark();
+    end = (std::min)(end, limit);
+    if (flush) {
+        end = o.mix_pos + (end - o.mix_pos + fs - 1) / fs * fs;
+    }
+    while (o.mix_pos + fs <= end) {
         AVFrame *f = av_frame_alloc();
         f->format = AV_SAMPLE_FMT_FLTP;
         f->sample_rate = kAudioRate;
@@ -612,18 +764,26 @@ void Recorder::encode_audio_fifo(bool flush) {
             av_frame_free(&f);
             return;
         }
-        av_audio_fifo_read(o.fifo, (void **) f->data, n);
-        for (int ch = 0; ch < kAudioChannels && n < fs; ++ch) {
-            memset(f->data[ch] + (size_t) n * sizeof(float), 0, (size_t) (fs - n) * sizeof(float));
+        size_t have = (std::min)(o.mix.size() / kAudioChannels, (size_t) fs);
+        auto *l = (float *) f->data[0];
+        auto *r = (float *) f->data[1];
+        for (size_t i = 0; i < (size_t) fs; ++i) {
+            float a = i < have ? o.mix[i * 2] : 0.0f;
+            float b = i < have ? o.mix[i * 2 + 1] : 0.0f;
+            l[i] = a > 1.0f ? 1.0f : (a < -1.0f ? -1.0f : a);
+            r[i] = b > 1.0f ? 1.0f : (b < -1.0f ? -1.0f : b);
         }
-        f->pts = o.a_next;
-        o.a_next += n;
+        o.mix.erase(o.mix.begin(), o.mix.begin() + (ptrdiff_t) (have * kAudioChannels));
+        f->pts = o.mix_pos;
+        o.mix_pos += fs;
         int err = avcodec_send_frame(o.aenc, f);
         av_frame_free(&f);
         if (err < 0 && err != AVERROR(EAGAIN)) {
             return;
         }
-        write_packets(o.aenc, o.ast, false);
+        if (!write_packets(o.aenc, o.ast, false)) {
+            return;
+        }
     }
 }
 
@@ -742,8 +902,7 @@ bool Recorder::open_audio_encoder() {
         return false;
     }
     o.aenc = c;
-    o.fifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_FLTP, kAudioChannels, kAudioRate);
-    return o.fifo != nullptr;
+    return true;
 }
 
 bool Recorder::open_output(int w, int h) {
@@ -798,8 +957,8 @@ void Recorder::close_output() {
     }
     Out &o = *out_;
     if (o.header_written && o.pkt) {
-        if (o.aenc && o.fifo) {
-            encode_audio_fifo(true);
+        if (o.aenc) {
+            pump_mix(true);
             write_packets(o.aenc, o.ast, true);
         }
         if (o.venc) {
@@ -822,9 +981,6 @@ void Recorder::close_output() {
     avcodec_free_context(&o.aenc);
     av_packet_free(&o.pkt);
     swr_free(&o.swr);
-    if (o.fifo) {
-        av_audio_fifo_free(o.fifo);
-    }
     delete out_;
     out_ = nullptr;
 }

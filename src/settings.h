@@ -18,6 +18,9 @@ struct Settings {
     int max_fps = 60;
     bool high_quality = true; // advertise a 4K display and accept HEVC, so iOS mirrors at native sharpness
     bool smooth = false;      // present on vsync with a tiny buffer instead of the instant the frame decodes
+    bool mic_enabled = false; // mix a microphone into recorded clips
+    std::string mic_device;   // WASAPI endpoint id (UTF-8); empty = Windows default recording device
+    int mic_gain_pct = 100;
     int win_x = 0, win_y = 0, win_w = 0, win_h = 0; // 0 size = default placement
 };
 
