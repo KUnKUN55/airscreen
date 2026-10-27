@@ -181,6 +181,7 @@ void toggle_recording(App *app) {
     swprintf_s(name, L"\\AirScreen_%04d-%02d-%02d_%02d-%02d-%02d.mp4", st.wYear, st.wMonth, st.wDay, st.wHour,
                st.wMinute, st.wSecond);
     rec.start(recordings_dir() + name);
+    app->receiver.video().prime_recorder(); // start from what's on screen now, even if the phone is idle
     app->recording = true;
     SetTimer(app->hwnd, kTimerRec, 500, nullptr);
     update_title(app);

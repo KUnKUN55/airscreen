@@ -36,6 +36,9 @@ public:
     // doesn't reach the screen. Off: show every frame the moment it decodes, for the lowest latency.
     void set_smooth(bool on) { smooth_.store(on); }
     void set_recorder(Recorder *rec);
+    // Hands the picture currently on screen to the recorder, so a clip starts at once even if the phone's
+    // screen is still (iOS only sends frames when something changes). False if nothing has been shown yet.
+    bool prime_recorder();
     void clear();
 
     int width() const { return width_.load(); }
@@ -123,6 +126,8 @@ private:
     std::mutex mu_;
     std::function<void()> first_frame_fn_;
     Recorder *recorder_ = nullptr; // guarded by mu_
+    int64_t last_pts_us_ = 0;      // sender time of the picture in nv12_; guarded by mu_
+    int64_t last_local_us_ = 0;    // local time it was decoded; guarded by mu_
 
     // Packets are never dropped one at a time: losing one corrupts every frame after it until the next
     // keyframe, which iOS rarely sends. A backlog is decoded in full and only its newest frame is shown.

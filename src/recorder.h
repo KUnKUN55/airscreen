@@ -44,6 +44,10 @@ public:
 
     // Decode thread, with the video pipeline's D3D11 lock held. `frame` is an AVFrame.
     void on_video_frame(ID3D11Device *device, ID3D11DeviceContext *ctx, const void *frame, int w, int h);
+    // A GPU NV12 picture (array slice `index`) at sender time `pts_us`; also how a clip is started from the
+    // picture already on screen, since iOS sends nothing new until the screen changes.
+    void on_video_texture(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, unsigned index,
+                          int w, int h, int64_t pts_us);
     // Audio decode thread.
     void on_audio_pcm(const int16_t *pcm, int frames, int channels, int rate, uint64_t ntp_ns);
 
@@ -72,6 +76,10 @@ private:
 
     void writer_loop();
     bool handle_video(Item &it);
+    bool encode_last_frame(int64_t pts_us);
+    bool repeat_if_still();
+    bool video_slot_free();
+    void push_video(Item &&it);
     void handle_audio(Item &it);
     void mix_in(int src, const float *pcm, int frames, int64_t at, bool timed);
     void pump_mix(bool flush, int64_t limit = INT64_MAX);
@@ -103,6 +111,8 @@ private:
     // Shared between the decode thread (producer) and the writer: the clip's zero point on the sender clock.
     std::atomic<int64_t> base_us_{INT64_MIN};
     std::atomic<int64_t> last_video_us_{0};
+    std::atomic<int64_t> base_local_us_{0}; // local time of the clip's first picture; 0 = none yet
+    std::atomic<int64_t> end_local_us_{0};  // local time the clip was stopped
     std::atomic<int64_t> offset_us_{INT64_MIN}; // local clock minus sender clock, from the video frames
     int64_t win_start_ = 0;                     // windowed minimum behind offset_us_; decode thread only
     int64_t cur_min_ = 0;

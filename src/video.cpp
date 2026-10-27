@@ -325,6 +325,17 @@ void VideoPipeline::set_recorder(Recorder *rec) {
     recorder_ = rec;
 }
 
+bool VideoPipeline::prime_recorder() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!recorder_ || !has_frame_.load() || !nv12_ || tex_w_ <= 0 || tex_h_ <= 0) {
+        return false;
+    }
+    // The picture on screen, stamped as if the phone had sent it just now.
+    int64_t pts = last_pts_us_ + (now_us() - last_local_us_);
+    recorder_->on_video_texture(device_, ctx_, nv12_, 0, tex_w_, tex_h_, pts);
+    return true;
+}
+
 void VideoPipeline::set_first_frame_fn(std::function<void()> fn) {
     std::lock_guard<std::mutex> lock(mu_);
     first_frame_fn_ = std::move(fn);
@@ -845,6 +856,8 @@ void VideoPipeline::decode_packet(const EncodedPacket &pkt, bool present) {
         } else if (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVJ420P) {
             upload_yuv420(frame->data[0], frame->linesize[0], frame->data[1], frame->data[2], frame->linesize[1], w, h);
         }
+        last_pts_us_ = frame->pts != AV_NOPTS_VALUE ? frame->pts : now_us();
+        last_local_us_ = now_us();
         if (recorder_ && recorder_->active()) {
             recorder_->on_video_frame(device_, ctx_, frame, w, h);
         }

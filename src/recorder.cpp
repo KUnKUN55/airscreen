@@ -42,6 +42,7 @@ constexpr int64_t kSourceIdleUs = 500000;
 // The clock offset is the smallest delay seen over the last one to two windows, so it follows the network
 // getting slower within a few seconds instead of clinging to the best case forever.
 constexpr int64_t kOffsetWindowUs = 2000000;
+constexpr int64_t kRepeatUs = 500000;
 
 void rlog(const char *fmt, ...) {
     char buf[384];
@@ -169,6 +170,8 @@ struct Recorder::Out {
     int h = 0;
     int64_t part_base_us = 0;
     int64_t last_vpts = -1;
+    AVFrame *last_frame = nullptr; // latest picture, for repeating while the screen is still
+    int64_t last_video_local = 0;  // local time a picture was last encoded
     bool header_written = false;
     std::wstring final_path;
     std::wstring part_path; // fragmented MP4 being written; becomes final_path when the clip ends
@@ -202,6 +205,8 @@ bool Recorder::start(const std::wstring &path) {
     last_video_us_ = 0;
     offset_us_ = INT64_MIN;
     win_start_ = 0;
+    base_local_us_ = 0;
+    end_local_us_ = 0;
     dropped_ = 0;
     run_ = true;
     active_ = true;
@@ -219,6 +224,9 @@ void Recorder::stop() {
         active_ = false;
         return;
     }
+    if (base_local_us_.load() && !end_local_us_.load()) {
+        end_local_us_ = local_us();
+    }
     {
         std::lock_guard<std::mutex> lock(q_mu_);
         run_ = false;
@@ -234,12 +242,15 @@ void Recorder::stop() {
     queued_video_ = 0;
 }
 
+// Wall-clock length of the clip so far. iPhone frames only arrive when the screen changes, so counting by
+// frames would freeze the timer while you talk over a still screen.
 double Recorder::seconds() const {
-    int64_t base = base_us_.load();
-    if (base == INT64_MIN) {
+    int64_t start = base_local_us_.load();
+    if (start == 0) {
         return 0;
     }
-    return (double) (last_video_us_.load() - base) / 1e6;
+    int64_t end = end_local_us_.load();
+    return (double) ((end ? end : local_us()) - start) / 1e6;
 }
 
 std::wstring Recorder::path() const {
@@ -345,50 +356,73 @@ void Recorder::on_video_frame(ID3D11Device *device, ID3D11DeviceContext *ctx, co
     }
     auto *frame = (const AVFrame *) frame_ptr;
     int64_t pts = frame->pts != AV_NOPTS_VALUE ? frame->pts : local_us();
-    {
-        std::lock_guard<std::mutex> lock(q_mu_);
-        if (!run_) {
-            return;
-        }
-        if (queued_video_ >= kMaxQueuedVideo) {
-            if ((++dropped_ % 60) == 1) {
-                rlog("encoder behind, skipped %llu frames so far", (unsigned long long) dropped_);
-            }
-            return;
-        }
+    if (frame->format == AV_PIX_FMT_D3D11) {
+        on_video_texture(device, ctx, (ID3D11Texture2D *) frame->data[0], (unsigned) (intptr_t) frame->data[1], w, h,
+                         pts);
+        return;
+    }
+    if (frame->format != AV_PIX_FMT_NV12 && frame->format != AV_PIX_FMT_YUV420P &&
+        frame->format != AV_PIX_FMT_YUVJ420P) {
+        return;
+    }
+    if (!video_slot_free()) {
+        return;
     }
     Item it;
     it.video = true;
     it.pts_us = pts;
     it.w = w;
     it.h = h;
-    if (frame->format == AV_PIX_FMT_D3D11) {
-        auto *tex = (ID3D11Texture2D *) frame->data[0];
-        if (!tex) {
-            return;
-        }
-        it.staging = take_staging(device, w, h);
-        if (!it.staging) {
-            return;
-        }
-        D3D11_BOX box = {0, 0, 0, (UINT) w, (UINT) h, 1};
-        ctx->CopySubresourceRegion(it.staging, 0, 0, 0, 0, tex, (UINT) (intptr_t) frame->data[1], &box);
-        ctx_ = ctx;
-    } else if (frame->format == AV_PIX_FMT_NV12 || frame->format == AV_PIX_FMT_YUV420P ||
-               frame->format == AV_PIX_FMT_YUVJ420P) {
-        it.sw_frame = av_frame_clone(frame);
-        if (!it.sw_frame) {
-            return;
-        }
-    } else {
+    it.sw_frame = av_frame_clone(frame);
+    if (it.sw_frame) {
+        push_video(std::move(it));
+    }
+}
+
+void Recorder::on_video_texture(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *tex, unsigned index,
+                                int w, int h, int64_t pts_us) {
+    if (!active_.load() || !tex || w <= 0 || h <= 0 || !video_slot_free()) {
         return;
     }
+    Item it;
+    it.video = true;
+    it.pts_us = pts_us;
+    it.w = w;
+    it.h = h;
+    it.staging = take_staging(device, w, h);
+    if (!it.staging) {
+        return;
+    }
+    D3D11_BOX box = {0, 0, 0, (UINT) w, (UINT) h, 1};
+    ctx->CopySubresourceRegion(it.staging, 0, 0, 0, 0, tex, index, &box);
+    ctx_ = ctx;
+    push_video(std::move(it));
+}
+
+bool Recorder::video_slot_free() {
+    std::lock_guard<std::mutex> lock(q_mu_);
+    if (!run_) {
+        return false;
+    }
+    if (queued_video_ >= kMaxQueuedVideo) {
+        if ((++dropped_ % 60) == 1) {
+            rlog("encoder behind, skipped %llu frames so far", (unsigned long long) dropped_);
+        }
+        return false;
+    }
+    return true;
+}
+
+void Recorder::push_video(Item &&it) {
+    int64_t pts = it.pts_us;
+    int64_t now = local_us();
     int64_t expect = INT64_MIN;
-    base_us_.compare_exchange_strong(expect, pts);
+    if (base_us_.compare_exchange_strong(expect, pts)) {
+        base_local_us_ = now;
+    }
     last_video_us_ = pts;
     // Track local clock minus sender clock using the least-delayed frame of the last few seconds. The mic is
     // timed on the local clock; this puts it on the same timeline as the video.
-    int64_t now = local_us();
     int64_t d = now - pts;
     if (win_start_ == 0 || now - win_start_ >= kOffsetWindowUs) {
         prev_min_ = win_start_ == 0 ? d : cur_min_;
@@ -503,17 +537,14 @@ void Recorder::writer_loop() {
                 }
             }
         }
-        if (!have) {
-            if (out_ && !failed) {
-                pump_mix(false);
-            }
-            continue;
-        }
         if (!failed) {
-            if (it.video) {
+            if (have && it.video) {
                 failed = !handle_video(it);
-            } else if (out_) {
+            } else if (have && out_) {
                 handle_audio(it);
+            }
+            if (out_ && !failed) {
+                failed = !repeat_if_still();
             }
             if (out_ && !failed) {
                 pump_mix(false);
@@ -626,11 +657,40 @@ bool Recorder::handle_video(Item &it) {
         return true;
     }
 
-    int64_t pts = (it.pts_us - o.part_base_us) * kVideoTimebase / 1000000;
+    av_frame_free(&o.last_frame);
+    o.last_frame = av_frame_clone(f); // shares the buffers; kept to repeat while the screen is still
+    av_frame_free(&f);
+    return encode_last_frame(it.pts_us);
+}
+
+// iOS sends nothing while the screen doesn't change. Repeat the last picture twice a second meanwhile, so the
+// file keeps growing (and stays crash-safe) under a narration, and editors don't see a frozen gap.
+bool Recorder::repeat_if_still() {
+    Out &o = *out_;
+    int64_t off = offset_us_.load();
+    int64_t now = local_us();
+    if (!o.last_frame || off == INT64_MIN || now - o.last_video_local < kRepeatUs) {
+        return true;
+    }
+    return encode_last_frame(now - off);
+}
+
+// Encodes the most recent picture at sender time `pts_us`.
+bool Recorder::encode_last_frame(int64_t pts_us) {
+    Out &o = *out_;
+    if (!o.last_frame) {
+        return true;
+    }
+    int64_t pts = (pts_us - o.part_base_us) * kVideoTimebase / 1000000;
     if (pts <= o.last_vpts) {
         pts = o.last_vpts + 1;
     }
     o.last_vpts = pts;
+    o.last_video_local = local_us();
+    AVFrame *f = av_frame_clone(o.last_frame);
+    if (!f) {
+        return true;
+    }
     f->pts = pts;
     int err = avcodec_send_frame(o.venc, f);
     av_frame_free(&f);
@@ -981,6 +1041,7 @@ void Recorder::close_output() {
     avcodec_free_context(&o.aenc);
     av_packet_free(&o.pkt);
     swr_free(&o.swr);
+    av_frame_free(&o.last_frame);
     delete out_;
     out_ = nullptr;
 }
