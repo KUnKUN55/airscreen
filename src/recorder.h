@@ -23,8 +23,9 @@ namespace airscreen {
 // re-encoded, on the GPU when possible (NVENC, Quick Sync, AMF), with a keyframe every two seconds.
 //
 // The decode thread only queues a GPU copy into a staging texture; the readback, encoding and disk writes
-// all happen on the recorder's own thread, so recording never holds up what's on screen. The file is a
-// fragmented MP4, which stays playable up to the last fragment even if AirScreen is killed mid-clip.
+// all happen on the recorder's own thread, so recording never holds up what's on screen. While recording,
+// the file is a fragmented "<name>.mp4.part", playable up to the last fragment even if AirScreen is killed
+// mid-clip; when the clip ends it is remuxed into a plain "<name>.mp4" that Windows' players open.
 class Recorder {
 public:
     Recorder();
@@ -103,6 +104,7 @@ private:
     int part_ = 1;
 
     Out *out_ = nullptr; // writer thread only
+    std::thread remux_;  // finalizes the previous file; started and joined by the writer thread, then ~Recorder
 };
 
 } // namespace airscreen

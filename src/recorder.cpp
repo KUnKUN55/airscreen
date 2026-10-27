@@ -80,6 +80,65 @@ void copy_nv12(AVFrame *dst, const uint8_t *y, int y_pitch, const uint8_t *uv, i
     }
 }
 
+// Stream-copies the fragmented recording into a plain MP4 (one moov) that every player, Windows' included,
+// opens. Nothing is re-encoded. If it fails the fragmented file is kept under the final name instead, which
+// VLC and browsers still play.
+void finalize_clip(std::wstring part, std::wstring final_path) {
+    std::wstring tmp = final_path + L".tmp";
+    std::string in_name = utf8(part);
+    std::string out_name = utf8(tmp);
+    AVFormatContext *in = nullptr;
+    AVFormatContext *out = nullptr;
+    AVPacket *pkt = av_packet_alloc();
+    bool ok = false;
+    int err = avformat_open_input(&in, in_name.c_str(), nullptr, nullptr);
+    if (err >= 0 && (err = avformat_find_stream_info(in, nullptr)) >= 0 &&
+        (err = avformat_alloc_output_context2(&out, nullptr, "mp4", out_name.c_str())) >= 0) {
+        for (unsigned i = 0; i < in->nb_streams && err >= 0; ++i) {
+            AVStream *st = avformat_new_stream(out, nullptr);
+            err = st ? avcodec_parameters_copy(st->codecpar, in->streams[i]->codecpar) : AVERROR(ENOMEM);
+            if (st) {
+                st->codecpar->codec_tag = 0;
+                st->time_base = in->streams[i]->time_base;
+            }
+        }
+        if (err >= 0 && (err = avio_open(&out->pb, out_name.c_str(), AVIO_FLAG_WRITE)) >= 0 &&
+            (err = avformat_write_header(out, nullptr)) >= 0) {
+            while ((err = av_read_frame(in, pkt)) >= 0) {
+                AVStream *ist = in->streams[pkt->stream_index];
+                AVStream *ost = out->streams[pkt->stream_index];
+                av_packet_rescale_ts(pkt, ist->time_base, ost->time_base);
+                pkt->pos = -1;
+                err = av_interleaved_write_frame(out, pkt);
+                av_packet_unref(pkt);
+                if (err < 0) {
+                    break;
+                }
+            }
+            if (err == AVERROR_EOF) {
+                err = av_write_trailer(out);
+                ok = err >= 0;
+            }
+        }
+    }
+    if (out && out->pb) {
+        avio_closep(&out->pb);
+    }
+    avformat_free_context(out);
+    avformat_close_input(&in);
+    av_packet_free(&pkt);
+
+    if (ok && MoveFileExW(tmp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(part.c_str());
+        rlog("saved %s", utf8(final_path).c_str());
+    } else {
+        DeleteFileW(tmp.c_str());
+        MoveFileExW(part.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        rlog("could not finalize %s (%s); kept the fragmented file", utf8(final_path).c_str(),
+             ok ? "rename failed" : av_error(err).c_str());
+    }
+}
+
 } // namespace
 
 struct Recorder::Out {
@@ -100,12 +159,17 @@ struct Recorder::Out {
     int64_t part_base_us = 0;
     int64_t last_vpts = -1;
     bool header_written = false;
+    std::wstring final_path;
+    std::wstring part_path; // fragmented MP4 being written; becomes final_path when the clip ends
 };
 
 Recorder::Recorder() = default;
 
 Recorder::~Recorder() {
     stop();
+    if (remux_.joinable()) {
+        remux_.join(); // let the last clip finish turning into a plain MP4 before the app exits
+    }
     for (auto *t : pool_) {
         t->Release();
     }
@@ -687,7 +751,9 @@ bool Recorder::open_output(int w, int h) {
     Out &o = *out_;
     o.w = w;
     o.h = h;
-    std::string file = utf8(path());
+    o.final_path = path();
+    o.part_path = o.final_path + L".part";
+    std::string file = utf8(o.part_path);
     if (avformat_alloc_output_context2(&o.fmt, nullptr, "mp4", file.c_str()) < 0 || !o.fmt) {
         set_error("could not create the MP4 muxer");
         return false;
@@ -711,7 +777,8 @@ bool Recorder::open_output(int w, int h) {
         return false;
     }
     AVDictionary *opts = nullptr;
-    // Fragmented: every keyframe closes a fragment, so a crash or power cut loses at most two seconds.
+    // Fragmented while recording: every keyframe closes a fragment, so a crash or power cut loses at most
+    // two seconds. Windows' own players can't open fragmented MP4, so close_output() remuxes it afterwards.
     av_dict_set(&opts, "movflags", "+frag_keyframe+empty_moov+default_base_moof", 0);
     err = avformat_write_header(o.fmt, &opts);
     av_dict_free(&opts);
@@ -742,6 +809,13 @@ void Recorder::close_output() {
     }
     if (o.fmt && o.fmt->pb) {
         avio_closep(&o.fmt->pb);
+    }
+    if (o.header_written) {
+        // Off the writer thread, so stopping (and the UI waiting on it) doesn't sit through a multi-GB copy.
+        if (remux_.joinable()) {
+            remux_.join();
+        }
+        remux_ = std::thread(finalize_clip, o.part_path, o.final_path);
     }
     avformat_free_context(o.fmt);
     avcodec_free_context(&o.venc);
