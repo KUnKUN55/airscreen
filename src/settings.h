@@ -28,6 +28,8 @@ struct Settings {
     std::string background_image; // copy of the chosen picture in %APPDATA%\AirScreen (UTF-8 path)
     std::string scene_text[6] = {"เริ่มในอีกสักครู่", "", "พักสักครู่", "เดี๋ยวกลับมาต่อ", "ขอบคุณที่รับชม", ""};
     // (title, subtitle) for Intro, Break and Outro, UTF-8
+    bool screen_caption = false; // a lower-third caption on the Screen scene
+    std::string screen_text[2] = {"", ""}; // its (title, subtitle), UTF-8
     int win_x = 0, win_y = 0, win_w = 0, win_h = 0; // 0 size = default placement
 };
 

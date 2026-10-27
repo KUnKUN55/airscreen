@@ -26,7 +26,8 @@ public:
         std::wstring subtitle;
     };
 
-    // GDI+ render of a title card's text: premultiplied BGRA, top-down, w*h pixels.
+    // GDI+ render of a scene's text (a title card, or the Screen scene's lower-third caption): premultiplied
+    // BGRA, top-down, w*h pixels; empty when there is nothing to draw.
     static std::vector<uint32_t> build_overlay(Scene scene, const Text &text, int w, int h);
     // Loads a picture file (PNG, JPEG, BMP, GIF, TIFF) scaled and centre-cropped to fill w*h; empty on failure.
     static std::vector<uint32_t> load_cover(const std::wstring &path, int w, int h);

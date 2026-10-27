@@ -223,10 +223,10 @@ const wchar_t *pick_face(std::initializer_list<const wchar_t *> faces) {
 } // namespace
 
 std::vector<uint32_t> Studio::build_overlay(Scene scene, const Text &text, int w, int h) {
-    std::vector<uint32_t> px((size_t) w * (size_t) h, 0);
-    if (scene == Screen || w <= 0 || h <= 0) {
-        return px;
+    if (w <= 0 || h <= 0 || (scene == Screen && text.title.empty() && text.subtitle.empty())) {
+        return {}; // nothing to draw: no overlay at all
     }
+    std::vector<uint32_t> px((size_t) w * (size_t) h, 0);
     using namespace Gdiplus;
     Bitmap bmp(w, h, w * 4, PixelFormat32bppPARGB, (BYTE *) px.data());
     Graphics g(&bmp);
@@ -246,6 +246,58 @@ std::vector<uint32_t> Studio::build_overlay(Scene scene, const Text &text, int w
     StringFormat fmt(StringFormat::GenericTypographic());
     fmt.SetFormatFlags(fmt.GetFormatFlags() | StringFormatFlagsNoWrap);
     fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+
+    if (scene == Screen) {
+        // A lower third: a dark glass plate in the bottom-left corner with a blue accent edge, the title over a
+        // smaller line. Small enough to leave the picture alone.
+        Font t_f(title_face, (float) h * 0.036f, title_style, UnitPixel);
+        Font s_f(sub_face, (float) h * 0.025f, FontStyleRegular, UnitPixel);
+        float max_text = (float) w * 0.42f;
+        auto width = [&](const std::wstring &s, const Font &f) {
+            if (s.empty()) {
+                return 0.f;
+            }
+            RectF box;
+            g.MeasureString(s.c_str(), (INT) s.size(), &f, PointF(0, 0), &fmt, &box);
+            return (std::min)(box.Width, max_text);
+        };
+        float pad_x = (float) h * 0.026f, pad_y = (float) h * 0.020f, accent = (float) h * 0.006f;
+        float t_h = text.title.empty() ? 0 : t_f.GetSize() * 1.28f;
+        float s_h = text.subtitle.empty() ? 0 : s_f.GetSize() * 1.38f;
+        float gap = (t_h > 0 && s_h > 0) ? (float) h * 0.004f : 0;
+        float box_w = accent + pad_x * 2 + (std::max)(width(text.title, t_f), width(text.subtitle, s_f));
+        float box_h = pad_y * 2 + t_h + gap + s_h;
+        float bx = (float) w * 0.04f, by = (float) h * 0.93f - box_h;
+        float r = (float) h * 0.014f;
+
+        GraphicsPath plate;
+        plate.AddArc(bx, by, r * 2, r * 2, 180, 90);
+        plate.AddArc(bx + box_w - r * 2, by, r * 2, r * 2, 270, 90);
+        plate.AddArc(bx + box_w - r * 2, by + box_h - r * 2, r * 2, r * 2, 0, 90);
+        plate.AddArc(bx, by + box_h - r * 2, r * 2, r * 2, 90, 90);
+        plate.CloseFigure();
+        SolidBrush fill(Color(165, 10, 12, 20));
+        g.FillPath(&fill, &plate);
+        g.SetClip(&plate);
+        SolidBrush blue(Color(255, 10, 132, 255));
+        g.FillRectangle(&blue, bx, by, accent, box_h);
+        g.ResetClip();
+        Pen rim(Color(40, 255, 255, 255), (std::max)(1.f, (float) h / 1080.f));
+        g.DrawPath(&rim, &plate);
+
+        float tx = bx + accent + pad_x, ty = by + pad_y;
+        SolidBrush white(Color(255, 255, 255, 255)), soft(Color(205, 255, 255, 255));
+        if (t_h > 0) {
+            g.DrawString(text.title.c_str(), (INT) text.title.size(), &t_f, RectF(tx, ty, max_text, t_h * 1.2f), &fmt,
+                         &white);
+            ty += t_h + gap;
+        }
+        if (s_h > 0) {
+            g.DrawString(text.subtitle.c_str(), (INT) text.subtitle.size(), &s_f, RectF(tx, ty, max_text, s_h * 1.2f),
+                         &fmt, &soft);
+        }
+        return px;
+    }
 
     float x = (float) w * 0.08f;
     float max_w = (float) w * 0.84f;
@@ -689,6 +741,9 @@ void Studio::draw_scene(Scene scene, ID3D11ShaderResourceView *src, int src_w, i
                    (float) (std::max)(1, src_w >> lod), (float) (std::max)(1, src_h >> lod), 0, 0};
     set_cb(cb_, c, 12);
     draw(ps_card_, src, cb_, true, false);
+    if (overlay_srv_[Screen]) {
+        draw(ps_tex_, overlay_srv_[Screen], cb_, true, true); // the caption, if one is set
+    }
 }
 
 void Studio::render(ID3D11ShaderResourceView *src, int src_w, int src_h, int src_mips, double now_s) {

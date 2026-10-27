@@ -449,10 +449,17 @@ const wchar_t *const kSceneNames[4] = {L"Intro", L"Screen", L"Break", L"Outro"};
 void apply_studio(App *app) {
     std::vector<std::wstring> texts;
     for (int s = 0; s < 4; ++s) {
-        // Settings keep (title, subtitle) for the three title cards; the Screen scene has none.
-        int i = s == 0 ? 0 : s == 2 ? 2 : s == 3 ? 4 : -1;
-        texts.push_back(i < 0 ? L"" : app->utf16(app->settings.scene_text[i]));
-        texts.push_back(i < 0 ? L"" : app->utf16(app->settings.scene_text[i + 1]));
+        if (s == 1) {
+            // The Screen scene's caption, only while it's switched on.
+            bool on = app->settings.screen_caption;
+            texts.push_back(on ? app->utf16(app->settings.screen_text[0]) : L"");
+            texts.push_back(on ? app->utf16(app->settings.screen_text[1]) : L"");
+            continue;
+        }
+        // (title, subtitle) for the three title cards.
+        int i = s == 0 ? 0 : s == 2 ? 2 : 4;
+        texts.push_back(app->utf16(app->settings.scene_text[i]));
+        texts.push_back(app->utf16(app->settings.scene_text[i + 1]));
     }
     auto &video = app->receiver.video();
     video.set_framed(app->settings.framed);
@@ -512,8 +519,24 @@ void select_scene(App *app, int scene) {
     note_activity(app);
 }
 
+// Reads an edit control as UTF-8.
+std::string dlg_text_utf8(HWND h, int id) {
+    wchar_t buf[128] = {};
+    GetDlgItemTextW(h, id, buf, 128);
+    int n = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? n - 1 : 0, 0);
+    WideCharToMultiByte(CP_UTF8, 0, buf, -1, s.data(), n, nullptr, nullptr);
+    return s;
+}
+
 INT_PTR CALLBACK scenes_dlg(HWND h, UINT msg, WPARAM w, LPARAM l) {
     auto *app = (App *) GetWindowLongPtrW(h, GWLP_USERDATA);
+    // The caption's text boxes follow its checkbox, so it's clear they only count when it's on.
+    auto sync_caption = [h] {
+        BOOL on = IsDlgButtonChecked(h, IDC_SCREEN_CAPTION) == BST_CHECKED;
+        EnableWindow(GetDlgItem(h, IDC_SCREEN_TEXT0), on);
+        EnableWindow(GetDlgItem(h, IDC_SCREEN_TEXT0 + 1), on);
+    };
     switch (msg) {
     case WM_INITDIALOG:
         app = (App *) l;
@@ -522,17 +545,26 @@ INT_PTR CALLBACK scenes_dlg(HWND h, UINT msg, WPARAM w, LPARAM l) {
             SetDlgItemTextW(h, IDC_SCENE_TEXT0 + i, app->utf16(app->settings.scene_text[i]).c_str());
             SendDlgItemMessageW(h, IDC_SCENE_TEXT0 + i, EM_LIMITTEXT, 120, 0);
         }
+        for (int i = 0; i < 2; ++i) {
+            SetDlgItemTextW(h, IDC_SCREEN_TEXT0 + i, app->utf16(app->settings.screen_text[i]).c_str());
+            SendDlgItemMessageW(h, IDC_SCREEN_TEXT0 + i, EM_LIMITTEXT, 120, 0);
+        }
+        CheckDlgButton(h, IDC_SCREEN_CAPTION, app->settings.screen_caption ? BST_CHECKED : BST_UNCHECKED);
+        sync_caption();
         return TRUE;
     case WM_COMMAND:
+        if (LOWORD(w) == IDC_SCREEN_CAPTION) {
+            sync_caption();
+            return TRUE;
+        }
         if (LOWORD(w) == IDOK) {
             for (int i = 0; i < 6; ++i) {
-                wchar_t buf[128] = {};
-                GetDlgItemTextW(h, IDC_SCENE_TEXT0 + i, buf, 128);
-                int n = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
-                std::string s(n > 0 ? n - 1 : 0, 0);
-                WideCharToMultiByte(CP_UTF8, 0, buf, -1, s.data(), n, nullptr, nullptr);
-                app->settings.scene_text[i] = s;
+                app->settings.scene_text[i] = dlg_text_utf8(h, IDC_SCENE_TEXT0 + i);
             }
+            for (int i = 0; i < 2; ++i) {
+                app->settings.screen_text[i] = dlg_text_utf8(h, IDC_SCREEN_TEXT0 + i);
+            }
+            app->settings.screen_caption = IsDlgButtonChecked(h, IDC_SCREEN_CAPTION) == BST_CHECKED;
             EndDialog(h, IDOK);
             return TRUE;
         }
@@ -545,11 +577,13 @@ INT_PTR CALLBACK scenes_dlg(HWND h, UINT msg, WPARAM w, LPARAM l) {
     return FALSE;
 }
 
-void edit_scene_text(App *app) {
-    if (DialogBoxParamW(app->inst, MAKEINTRESOURCEW(IDD_SCENES), app->hwnd, scenes_dlg, (LPARAM) app) == IDOK) {
-        airscreen::save_settings(app->settings);
-        apply_studio(app);
+bool edit_scene_text(App *app) {
+    if (DialogBoxParamW(app->inst, MAKEINTRESOURCEW(IDD_SCENES), app->hwnd, scenes_dlg, (LPARAM) app) != IDOK) {
+        return false;
     }
+    airscreen::save_settings(app->settings);
+    apply_studio(app);
+    return true;
 }
 
 HMENU build_scene_menu(App *app) {
@@ -561,7 +595,9 @@ HMENU build_scene_menu(App *app) {
                     IDM_SCENE_BASE + i, label);
     }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, IDM_SCENE_EDIT, L"Edit title cards…");
+    AppendMenuW(m, MF_STRING, IDM_SCENE_EDIT, L"Edit scene text…");
+    AppendMenuW(m, MF_STRING | (app->settings.screen_caption ? MF_CHECKED : 0), IDM_SCREEN_CAPTION,
+                L"Caption on the Screen scene");
     HMENU bg = CreatePopupMenu();
     const auto &s = app->settings;
     AppendMenuW(bg, MF_STRING | (s.background == 0 ? MF_CHECKED : 0), IDM_BG_COLORS, L"Studio colours");
@@ -717,6 +753,20 @@ void handle_tray_cmd(App *app, UINT id) {
         break;
     case IDM_SCENE_EDIT:
         edit_scene_text(app);
+        break;
+    case IDM_SCREEN_CAPTION:
+        if (!app->settings.screen_caption && app->settings.screen_text[0].empty() &&
+            app->settings.screen_text[1].empty()) {
+            // Nothing to show yet: open the editor with the caption ticked, so it can be typed straight away.
+            app->settings.screen_caption = true;
+            if (!edit_scene_text(app)) {
+                app->settings.screen_caption = false; // cancelled: leave it as it was
+            }
+            break;
+        }
+        app->settings.screen_caption = !app->settings.screen_caption;
+        airscreen::save_settings(app->settings);
+        apply_studio(app);
         break;
     case IDM_BG_COLORS:
     case IDM_BG_BLUR:

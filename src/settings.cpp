@@ -149,6 +149,12 @@ Settings load_settings() {
             s.canvas_h = (v == 1080 || v == 1440 || v == 2160) ? v : s.canvas_h;
         } else if (key == "Framed") {
             s.framed = (val == "1" || val == "true");
+        } else if (key == "ScreenCaption") {
+            s.screen_caption = (val == "1" || val == "true");
+        } else if (key == "ScreenText0") {
+            s.screen_text[0] = val;
+        } else if (key == "ScreenText1") {
+            s.screen_text[1] = val;
         } else if (key == "Background") {
             int v = atoi(val.c_str());
             s.background = (v >= 0 && v <= 2) ? v : 0;
@@ -184,6 +190,9 @@ void save_settings(const Settings &s) {
     out << "MicGain=" << s.mic_gain_pct << "\n";
     out << "CanvasHeight=" << s.canvas_h << "\n";
     out << "Framed=" << (s.framed ? 1 : 0) << "\n";
+    out << "ScreenCaption=" << (s.screen_caption ? 1 : 0) << "\n";
+    out << "ScreenText0=" << s.screen_text[0] << "\n";
+    out << "ScreenText1=" << s.screen_text[1] << "\n";
     out << "Background=" << s.background << "\n";
     out << "BackgroundImage=" << s.background_image << "\n";
     for (int i = 0; i < 6; ++i) {

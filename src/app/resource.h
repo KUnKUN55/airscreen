@@ -34,4 +34,7 @@
 
 #define IDD_SCENES          102
 #define IDC_SCENE_TEXT0     1010   // .. IDC_SCENE_TEXT0 + 5
+#define IDC_SCREEN_TEXT0    1016   // and 1017: the Screen scene caption
+#define IDC_SCREEN_CAPTION  1018
+#define IDM_SCREEN_CAPTION  40052
 #define IDM_MIC_DEV_BASE    40100  // + index into the device list (up to 99)
