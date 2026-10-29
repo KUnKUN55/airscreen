@@ -167,6 +167,38 @@ Settings load_settings() {
             s.mic_gain_pct = g > 0 && g <= 400 ? g : s.mic_gain_pct;
         } else if (key == "Window") {
             sscanf(val.c_str(), "%d,%d,%d,%d", &s.win_x, &s.win_y, &s.win_w, &s.win_h);
+        } else if (key == "Profile" && !val.empty()) {
+            s.profile = val;
+        } else if (key == "PanelAuto") {
+            s.panel_auto = atoi(val.c_str()) & 3;
+        } else if (key == "TeachMode") {
+            s.teach_mode = (val == "1" || val == "true");
+        } else if (key == "PanelTopmost") {
+            s.panel_topmost = (val == "1" || val == "true");
+        } else if (key == "PanelCompact") {
+            s.panel_compact = (val == "1" || val == "true");
+        } else if (key == "Panel") {
+            sscanf(val.c_str(), "%d,%d,%d,%d", &s.panel_x, &s.panel_y, &s.panel_w, &s.panel_h);
+        } else if (key == "Editor") {
+            sscanf(val.c_str(), "%d,%d,%d,%d", &s.editor_x, &s.editor_y, &s.editor_w, &s.editor_h);
+        } else if (key == "HideControls") {
+            s.hide_controls = (val == "1" || val == "true");
+        } else if (key == "ApplyMode") {
+            s.apply_mode = atoi(val.c_str()) == 1 ? 1 : 0;
+        } else if (key == "Transition") {
+            s.transition = atoi(val.c_str()) == 1 ? 1 : 0;
+        } else if (key == "CaptureCursor") {
+            s.capture_cursor = (val == "1" || val == "true");
+        } else if (key == "CaptureFps") {
+            s.capture_fps = atoi(val.c_str()) >= 60 ? 60 : 30;
+        } else if (key == "LastSource") {
+            s.last_source = val;
+        } else if (key == "Quick") {
+            s.quick = val;
+        } else if (key == "Hotkeys") {
+            s.hotkeys = (val == "1" || val == "true");
+        } else if (key == "HotkeyMap") {
+            s.hotkey_map = val;
         }
     }
     return s;
@@ -199,6 +231,22 @@ void save_settings(const Settings &s) {
         out << "SceneText" << i << "=" << s.scene_text[i] << "\n";
     }
     out << "Window=" << s.win_x << "," << s.win_y << "," << s.win_w << "," << s.win_h << "\n";
+    out << "Profile=" << s.profile << "\n";
+    out << "PanelAuto=" << s.panel_auto << "\n";
+    out << "TeachMode=" << (s.teach_mode ? 1 : 0) << "\n";
+    out << "PanelTopmost=" << (s.panel_topmost ? 1 : 0) << "\n";
+    out << "PanelCompact=" << (s.panel_compact ? 1 : 0) << "\n";
+    out << "Panel=" << s.panel_x << "," << s.panel_y << "," << s.panel_w << "," << s.panel_h << "\n";
+    out << "Editor=" << s.editor_x << "," << s.editor_y << "," << s.editor_w << "," << s.editor_h << "\n";
+    out << "HideControls=" << (s.hide_controls ? 1 : 0) << "\n";
+    out << "ApplyMode=" << s.apply_mode << "\n";
+    out << "Transition=" << s.transition << "\n";
+    out << "CaptureCursor=" << (s.capture_cursor ? 1 : 0) << "\n";
+    out << "CaptureFps=" << s.capture_fps << "\n";
+    out << "LastSource=" << s.last_source << "\n";
+    out << "Quick=" << s.quick << "\n";
+    out << "Hotkeys=" << (s.hotkeys ? 1 : 0) << "\n";
+    out << "HotkeyMap=" << s.hotkey_map << "\n";
 }
 
 std::string find_mac_address() {

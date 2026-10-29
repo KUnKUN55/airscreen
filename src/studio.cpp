@@ -18,8 +18,6 @@
 namespace airscreen {
 namespace {
 
-constexpr double kFadeSeconds = 0.5;
-
 const char *kVs = R"(
 struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD; };
 VSOut main(float2 pos : POSITION, float2 uv : TEXCOORD) {
@@ -103,8 +101,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
 }
 )";
 
-// c0 = picture rect (x, y, w, h) in canvas pixels, c1 = (corner radius, shadow size, lod, 0),
-// c2 = (texture size at lod). Inside the rounded rect: the picture, bicubic. Outside: a soft shadow below it.
+// c0 = picture rect (x, y, w, h) in target pixels, c1 = (corner radius, shadow size, lod, opacity),
+// c2 = (texture size at lod), c3 = (uv scale, uv offset) to crop a filled box. Inside the rounded rect: the
+// picture, bicubic. Outside: a soft shadow below it.
 const char *kPsCard = R"(
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
     float2 half_size = c[0].zw * 0.5;
@@ -115,21 +114,58 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
         if (s <= 0) discard;
         float ds = sd_round(pos.xy - ctr - float2(0, s * 0.3), half_size, r);
         float a = 1 - smoothstep(-s * 0.2, s, ds);
-        return float4(0, 0, 0, a * a * 0.6);
+        return float4(0, 0, 0, a * a * 0.6 * c[1].w);
     }
-    float2 p = (pos.xy - c[0].xy) / c[0].zw;
+    float2 p = (pos.xy - c[0].xy) / c[0].zw * c[3].xy + c[3].zw;
     float3 col = bicubic(p, c[2].xy, c[1].z);
-    return float4(col, saturate(0.5 - d));
+    return float4(col, saturate(0.5 - d) * c[1].w);
 }
 )";
 
-const char *kPsTex = R"(
+// c0 = rect, c1.x = opacity: a premultiplied texture (text, a logo) stretched over the rect.
+const char *kPsRect = R"(
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
-    return tex.SampleLevel(samp, uv, 0);
+    float2 p = (pos.xy - c[0].xy) / c[0].zw;
+    return tex.SampleLevel(samp, p, 0) * c[1].x;
 }
 )";
 
-// c0 = (dim): your background picture, darkened so whatever sits on it reads.
+// c0 = rect, c1 = (radius, border px, mode, opacity), c2 = colour A, c3 = colour B, c4 = border colour,
+// c5 = (lod, 1/width, 1/height, spread). Modes: 0 solid A, 1 gradient A to B (top to bottom), 2 frosted glass
+// (what is behind, blurred, tinted by A), 3 border only. Colours are straight RGBA.
+const char *kPsBox = R"(
+float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
+    float2 hs = c[0].zw * 0.5;
+    float d = sd_round(pos.xy - c[0].xy - hs, hs, c[1].x);
+    float cover = saturate(0.5 - d);
+    if (cover <= 0) discard;
+    float mode = c[1].z;
+    float4 fill = c[2];
+    if (mode > 0.5 && mode < 1.5) {
+        fill = lerp(c[2], c[3], saturate((pos.y - c[0].y) / c[0].w));
+    } else if (mode > 1.5 && mode < 2.5) {
+        float2 u = pos.xy * c[5].yz;
+        float2 o = c[5].yz * c[5].w;
+        float lod = c[5].x;
+        float3 b = tex.SampleLevel(samp, u, lod).rgb * 0.2;
+        b += (tex.SampleLevel(samp, u + float2(o.x, 0), lod).rgb + tex.SampleLevel(samp, u - float2(o.x, 0), lod).rgb +
+              tex.SampleLevel(samp, u + float2(0, o.y), lod).rgb + tex.SampleLevel(samp, u - float2(0, o.y), lod).rgb) * 0.125;
+        b += (tex.SampleLevel(samp, u + o, lod).rgb + tex.SampleLevel(samp, u - o, lod).rgb +
+              tex.SampleLevel(samp, u + float2(o.x, -o.y), lod).rgb + tex.SampleLevel(samp, u + float2(-o.x, o.y), lod).rgb) * 0.075;
+        fill = float4(lerp(b, c[2].rgb, c[2].a), 1);
+    } else if (mode > 2.5) {
+        fill = float4(c[4].rgb, 0);
+    }
+    float4 col = fill;
+    if (c[1].y > 0) {
+        float inner = saturate(0.5 - (d + c[1].y));
+        col = lerp(c[4], fill, inner);
+    }
+    return float4(col.rgb, col.a * cover * c[1].w);
+}
+)";
+
+// c0 = (dim): a backdrop picture.
 const char *kPsImg = R"(
 float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD) : SV_TARGET {
     return float4(tex.SampleLevel(samp, uv, 0).rgb * c[0].x, 1);
@@ -165,25 +201,25 @@ struct Palette {
     float top[4], bottom[4], a[4], b[4];
 };
 
-// Same moods as the idle window: blue to begin, amber for a pause, green to close.
-Palette palette(Studio::Scene s) {
+// The idle window's moods: night behind screens, blue to begin, amber for a pause, green to close.
+Palette palette(int mood) {
     auto P = [](int r, int g, int b, int a = 255) {
         return std::array<float, 4>{r / 255.f, g / 255.f, b / 255.f, a / 255.f};
     };
     std::array<float, 4> v[4];
-    switch (s) {
-    case Studio::Break:
+    switch (mood) {
+    case 2:
         v[0] = P(110, 68, 24), v[1] = P(42, 24, 10), v[2] = P(217, 151, 74, 153), v[3] = P(184, 106, 90, 115);
         break;
-    case Studio::Outro:
+    case 3:
         v[0] = P(26, 80, 64), v[1] = P(8, 32, 26), v[2] = P(84, 178, 126, 133), v[3] = P(74, 134, 216, 92);
         break;
-    case Studio::Screen:
-        // Behind the picture: deep night blue with faint blooms, so the screen is the brightest thing.
-        v[0] = P(20, 28, 56), v[1] = P(6, 8, 18), v[2] = P(52, 92, 170, 110), v[3] = P(86, 70, 160, 80);
+    case 1:
+        v[0] = P(28, 50, 114), v[1] = P(11, 21, 54), v[2] = P(74, 134, 216, 158), v[3] = P(109, 91, 196, 128);
         break;
     default:
-        v[0] = P(28, 50, 114), v[1] = P(11, 21, 54), v[2] = P(74, 134, 216, 158), v[3] = P(109, 91, 196, 128);
+        // Behind a screen: deep night blue with faint blooms, so the screen is the brightest thing.
+        v[0] = P(20, 28, 56), v[1] = P(6, 8, 18), v[2] = P(52, 92, 170, 110), v[3] = P(86, 70, 160, 80);
         break;
     }
     Palette p;
@@ -220,13 +256,34 @@ const wchar_t *pick_face(std::initializer_list<const wchar_t *> faces) {
     return L"Segoe UI";
 }
 
-} // namespace
-
-std::vector<uint32_t> Studio::build_overlay(Scene scene, const Text &text, int w, int h) {
-    if (w <= 0 || h <= 0 || (scene == Screen && text.title.empty() && text.subtitle.empty())) {
-        return {}; // nothing to draw: no overlay at all
+// FNV-1a over everything that changes a picture's pixels.
+struct Hasher {
+    uint64_t h = 1469598103934665603ull;
+    Hasher &bytes(const void *p, size_t n) {
+        auto *b = (const unsigned char *) p;
+        for (size_t i = 0; i < n; ++i) {
+            h = (h ^ b[i]) * 1099511628211ull;
+        }
+        return *this;
     }
+    template <typename T> Hasher &operator<<(const T &v) { return bytes(&v, sizeof(v)); }
+    Hasher &operator<<(const std::wstring &s) { return bytes(s.data(), s.size() * sizeof(wchar_t)) << s.size(); }
+};
+
+void argb(uint32_t c, float alpha, float *out) {
+    out[0] = ((c >> 16) & 255) / 255.f;
+    out[1] = ((c >> 8) & 255) / 255.f;
+    out[2] = (c & 255) / 255.f;
+    out[3] = alpha;
+}
+
+// The text drawn into a w*h picture: wrapped to the box, shrunk until it fits, with a soft shadow when it has
+// no box behind it to keep it readable. GDI+ has no font fallback, so Thai gets a face that carries both scripts.
+std::vector<uint32_t> raster_text(const Layer &l, int w, int h, int canvas_h) {
     std::vector<uint32_t> px((size_t) w * (size_t) h, 0);
+    if (l.text.empty() || w <= 0 || h <= 0) {
+        return px;
+    }
     using namespace Gdiplus;
     Bitmap bmp(w, h, w * 4, PixelFormat32bppPARGB, (BYTE *) px.data());
     Graphics g(&bmp);
@@ -234,126 +291,72 @@ std::vector<uint32_t> Studio::build_overlay(Scene scene, const Text &text, int w
     g.SetTextRenderingHint(TextRenderingHintAntiAlias);
     g.Clear(Color(0, 0, 0, 0));
 
-    // GDI+ has no font fallback, so Thai text gets a face that carries both scripts.
-    bool thai = has_thai(text.title) || has_thai(text.subtitle);
-    static const wchar_t *latin_title = pick_face({L"Segoe UI Variable Display Semibold", L"Segoe UI Semibold"});
+    static const wchar_t *latin_bold = pick_face({L"Segoe UI Variable Display Semibold", L"Segoe UI Semibold"});
     static const wchar_t *latin_text = pick_face({L"Segoe UI Variable Text", L"Segoe UI"});
     static const wchar_t *thai_face = pick_face({L"Leelawadee UI", L"Tahoma"});
-    const wchar_t *title_face = thai ? thai_face : latin_title;
-    const wchar_t *sub_face = thai ? thai_face : latin_text;
-    int title_style = thai ? FontStyleBold : FontStyleRegular;
+    bool thai = has_thai(l.text);
+    const wchar_t *face = thai ? thai_face : (l.bold ? latin_bold : latin_text);
+    int style = thai && l.bold ? FontStyleBold : FontStyleRegular;
 
+    float pad = (std::min)({l.padding * (float) canvas_h, (float) w * 0.25f, (float) h * 0.25f});
+    RectF area(pad, pad, (float) w - pad * 2, (float) h - pad * 2);
     StringFormat fmt(StringFormat::GenericTypographic());
-    fmt.SetFormatFlags(fmt.GetFormatFlags() | StringFormatFlagsNoWrap);
-    fmt.SetTrimming(StringTrimmingEllipsisCharacter);
+    fmt.SetFormatFlags(fmt.GetFormatFlags() & ~StringFormatFlagsNoWrap);
+    fmt.SetAlignment(l.align == 1 ? StringAlignmentCenter : (l.align == 2 ? StringAlignmentFar : StringAlignmentNear));
+    fmt.SetLineAlignment(StringAlignmentCenter);
+    fmt.SetTrimming(StringTrimmingNone);
 
-    if (scene == Screen) {
-        // A lower third: a dark glass plate in the bottom-left corner with a blue accent edge, the title over a
-        // smaller line. Small enough to leave the picture alone.
-        Font t_f(title_face, (float) h * 0.036f, title_style, UnitPixel);
-        Font s_f(sub_face, (float) h * 0.025f, FontStyleRegular, UnitPixel);
-        float max_text = (float) w * 0.42f;
-        auto width = [&](const std::wstring &s, const Font &f) {
-            if (s.empty()) {
-                return 0.f;
-            }
-            RectF box;
-            g.MeasureString(s.c_str(), (INT) s.size(), &f, PointF(0, 0), &fmt, &box);
-            return (std::min)(box.Width, max_text);
-        };
-        float pad_x = (float) h * 0.026f, pad_y = (float) h * 0.020f, accent = (float) h * 0.006f;
-        float t_h = text.title.empty() ? 0 : t_f.GetSize() * 1.28f;
-        float s_h = text.subtitle.empty() ? 0 : s_f.GetSize() * 1.38f;
-        float gap = (t_h > 0 && s_h > 0) ? (float) h * 0.004f : 0;
-        float box_w = accent + pad_x * 2 + (std::max)(width(text.title, t_f), width(text.subtitle, s_f));
-        float box_h = pad_y * 2 + t_h + gap + s_h;
-        float bx = (float) w * 0.04f, by = (float) h * 0.93f - box_h;
-        float r = (float) h * 0.014f;
-
-        GraphicsPath plate;
-        plate.AddArc(bx, by, r * 2, r * 2, 180, 90);
-        plate.AddArc(bx + box_w - r * 2, by, r * 2, r * 2, 270, 90);
-        plate.AddArc(bx + box_w - r * 2, by + box_h - r * 2, r * 2, r * 2, 0, 90);
-        plate.AddArc(bx, by + box_h - r * 2, r * 2, r * 2, 90, 90);
-        plate.CloseFigure();
-        SolidBrush fill(Color(165, 10, 12, 20));
-        g.FillPath(&fill, &plate);
-        g.SetClip(&plate);
-        SolidBrush blue(Color(255, 10, 132, 255));
-        g.FillRectangle(&blue, bx, by, accent, box_h);
-        g.ResetClip();
-        Pen rim(Color(40, 255, 255, 255), (std::max)(1.f, (float) h / 1080.f));
-        g.DrawPath(&rim, &plate);
-
-        float tx = bx + accent + pad_x, ty = by + pad_y;
-        SolidBrush white(Color(255, 255, 255, 255)), soft(Color(205, 255, 255, 255));
-        if (t_h > 0) {
-            g.DrawString(text.title.c_str(), (INT) text.title.size(), &t_f, RectF(tx, ty, max_text, t_h * 1.2f), &fmt,
-                         &white);
-            ty += t_h + gap;
-        }
-        if (s_h > 0) {
-            g.DrawString(text.subtitle.c_str(), (INT) text.subtitle.size(), &s_f, RectF(tx, ty, max_text, s_h * 1.2f),
-                         &fmt, &soft);
-        }
-        return px;
-    }
-
-    float x = (float) w * 0.08f;
-    float max_w = (float) w * 0.84f;
-    float title_px = (float) h * 0.085f;
-    {
-        Font probe(title_face, title_px, title_style, UnitPixel);
+    float em = (std::max)(4.f, l.font * (float) canvas_h * 0.8f);
+    for (int i = 0; i < 30 && em > 5; ++i) {
+        Font probe(face, em, style, UnitPixel);
         RectF box;
-        g.MeasureString(text.title.c_str(), (INT) text.title.size(), &probe, PointF(0, 0), &fmt, &box);
-        if (box.Width > max_w) {
-            title_px *= max_w / box.Width;
+        g.MeasureString(l.text.c_str(), (INT) l.text.size(), &probe, RectF(0, 0, area.Width, 100000.f), &fmt, &box);
+        if (box.Height <= area.Height + 0.5f) {
+            break;
         }
+        em *= 0.92f;
     }
-    float sub_px = (float) h * 0.042f;
-    Font title_f(title_face, title_px, title_style, UnitPixel);
-    Font sub_f(sub_face, sub_px, FontStyleRegular, UnitPixel);
-
-    // An accent bar, the title and a line under it, stacked as one block a touch above centre.
-    float bar_h = (float) h * 0.007f;
-    float gap1 = title_px * 0.42f;
-    float title_h = title_px * 1.25f;
-    float gap2 = title_px * 0.18f;
-    float sub_h = text.subtitle.empty() ? 0 : sub_px * 1.4f;
-    float total = bar_h + gap1 + title_h + gap2 + sub_h;
-    float y = ((float) h - total) * 0.5f - (float) h * 0.02f;
-
-    float shadow = (float) h * 0.004f;
-    auto text_line = [&](const std::wstring &s, const Font &f, float top, const Color &c) {
-        if (s.empty()) {
-            return;
-        }
-        RectF rc(x, top, max_w, f.GetSize() * 1.6f);
-        SolidBrush sh(Color(80, 0, 0, 0));
-        RectF rs = rc;
-        rs.Y += shadow;
-        g.DrawString(s.c_str(), (INT) s.size(), &f, rs, &fmt, &sh);
-        SolidBrush br(c);
-        g.DrawString(s.c_str(), (INT) s.size(), &f, rc, &fmt, &br);
-    };
-
-    {
-        GraphicsPath p;
-        float bw = (float) w * 0.045f;
-        p.AddArc(x, y, bar_h, bar_h, 90, 180);
-        p.AddArc(x + bw - bar_h, y, bar_h, bar_h, 270, 180);
-        p.CloseFigure();
-        SolidBrush b(Color(230, 255, 255, 255));
-        g.FillPath(&b, &p);
+    Font font(face, em, style, UnitPixel);
+    if (!l.has_box()) {
+        SolidBrush shadow(Color(110, 0, 0, 0));
+        RectF rs = area;
+        rs.Y += em * 0.05f;
+        rs.X += em * 0.02f;
+        g.DrawString(l.text.c_str(), (INT) l.text.size(), &font, rs, &fmt, &shadow);
     }
-    y += bar_h + gap1;
-    text_line(text.title, title_f, y, Color(255, 255, 255, 255));
-    y += title_h + gap2;
-    text_line(text.subtitle, sub_f, y, Color(210, 255, 255, 255));
+    SolidBrush brush(Color((BYTE) (l.color >> 24), (BYTE) (l.color >> 16), (BYTE) (l.color >> 8), (BYTE) l.color));
+    g.DrawString(l.text.c_str(), (INT) l.text.size(), &font, area, &fmt, &brush);
     return px;
 }
 
-std::vector<uint32_t> Studio::load_cover(const std::wstring &path, int w, int h) {
+uint64_t text_key(const Layer &l, int pw, int ph, int canvas_h) {
+    Hasher k;
+    k << 'T' << l.text << l.font << l.color << l.bold << l.align << l.padding << l.has_box() << pw << ph << canvas_h;
+    return k.h;
+}
+
+uint64_t picture_key(const std::wstring &path, int pw, int ph, bool cover) {
+    Hasher k;
+    k << (cover ? 'B' : 'I') << path << pw << ph;
+    return k.h;
+}
+
+uint64_t label_key(SourceKind kind) {
+    Hasher k;
+    k << 'L' << (int) kind;
+    return k.h;
+}
+
+constexpr int kLabelW = 900, kLabelH = 150;
+
+void layer_pixels(const Layer &l, int cw, int ch, int &pw, int &ph) {
+    pw = std::clamp((int) std::lround(l.w * (float) cw), 8, 4096);
+    ph = std::clamp((int) std::lround(l.h * (float) ch), 8, 4096);
+}
+
+} // namespace
+
+std::vector<uint32_t> Studio::load_picture(const std::wstring &path, int w, int h, bool cover) {
     using namespace Gdiplus;
     std::vector<uint32_t> px;
     if (path.empty() || w <= 0 || h <= 0) {
@@ -363,24 +366,154 @@ std::vector<uint32_t> Studio::load_cover(const std::wstring &path, int w, int h)
     if (src.GetLastStatus() != Ok || src.GetWidth() == 0 || src.GetHeight() == 0) {
         return px;
     }
-    // Fill the canvas: scale to cover, crop the overflow evenly from both sides.
     float sw = (float) src.GetWidth(), sh = (float) src.GetHeight();
-    float scale = (std::max)((float) w / sw, (float) h / sh);
-    float cw = (float) w / scale, ch = (float) h / scale;
-    RectF from((sw - cw) * 0.5f, (sh - ch) * 0.5f, cw, ch);
-    px.assign((size_t) w * (size_t) h, 0xff000000u);
+    px.assign((size_t) w * (size_t) h, cover ? 0xff000000u : 0u);
     Bitmap dst(w, h, w * 4, PixelFormat32bppPARGB, (BYTE *) px.data());
     Graphics g(&dst);
     g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
     g.SetPixelOffsetMode(PixelOffsetModeHalf);
-    g.SetCompositingMode(CompositingModeSourceCopy);
     ImageAttributes clamp;
     clamp.SetWrapMode(WrapModeTileFlipXY); // no dark fringe from sampling past the edge
-    g.DrawImage(&src, RectF(0, 0, (float) w, (float) h), from.X, from.Y, from.Width, from.Height, UnitPixel, &clamp);
-    for (auto &p : px) {
-        p |= 0xff000000u; // backgrounds are opaque, whatever the file's alpha
+    if (cover) {
+        // Fill: scale to cover, crop the overflow evenly from both sides.
+        float scale = (std::max)((float) w / sw, (float) h / sh);
+        float cw = (float) w / scale, ch = (float) h / scale;
+        g.SetCompositingMode(CompositingModeSourceCopy);
+        g.DrawImage(&src, RectF(0, 0, (float) w, (float) h), (sw - cw) * 0.5f, (sh - ch) * 0.5f, cw, ch, UnitPixel,
+                    &clamp);
+        for (auto &p : px) {
+            p |= 0xff000000u; // backdrops are opaque, whatever the file's alpha
+        }
+    } else {
+        // Fit: the whole picture, centred, its own transparency kept (logos).
+        float scale = (std::min)((float) w / sw, (float) h / sh);
+        float dw = sw * scale, dh = sh * scale;
+        g.DrawImage(&src, RectF(((float) w - dw) * 0.5f, ((float) h - dh) * 0.5f, dw, dh), 0, 0, sw, sh, UnitPixel,
+                    &clamp);
     }
     return px;
+}
+
+std::vector<uint32_t> Studio::make_raster(const Need &need) {
+    switch (need.kind) {
+    case Need::Picture:
+        return load_picture(need.path, need.w, need.h, false);
+    case Need::Cover:
+        return load_picture(need.path, need.w, need.h, true);
+    default:
+        return raster_text(need.layer, need.w, need.h, need.canvas_h);
+    }
+}
+
+std::vector<Studio::Need> Studio::needs(const Scene &scene, bool preview) const {
+    std::vector<Need> out;
+    if (cw_ <= 0 || ch_ <= 0) {
+        return out;
+    }
+    auto want = [&](Need n) {
+        if (!cache_.count(n.key)) {
+            for (auto &o : out) {
+                if (o.key == n.key) {
+                    return;
+                }
+            }
+            out.push_back(std::move(n));
+        }
+    };
+    if (scene.backdrop == Backdrop::Image && !scene.bg_image.empty()) {
+        Need n;
+        n.kind = Need::Cover;
+        n.path = scene.bg_image;
+        n.w = cw_;
+        n.h = ch_;
+        n.key = picture_key(n.path, cw_, ch_, true);
+        want(n);
+    }
+    for (auto &l : scene.layers) {
+        int pw, ph;
+        layer_pixels(l, cw_, ch_, pw, ph);
+        Need n;
+        n.w = pw;
+        n.h = ph;
+        n.canvas_h = ch_;
+        // Hidden text is drawn too, so showing it later is instant.
+        if (l.type == LayerType::Text && !l.text.empty()) {
+            n.kind = Need::Text;
+            n.layer = l;
+            n.key = text_key(l, pw, ph, ch_);
+            want(n);
+        } else if (l.type == LayerType::Image && !l.path.empty()) {
+            n.kind = Need::Picture;
+            n.path = l.path;
+            n.key = picture_key(l.path, pw, ph, false);
+            want(n);
+        } else if (l.type == LayerType::Source && preview) {
+            n.kind = Need::Label;
+            n.layer = Layer();
+            n.layer.text = l.source == SourceKind::IPad ? L"iPad · not connected" : L"Computer · not shared";
+            n.layer.font = 0.42f;
+            n.layer.align = 1;
+            n.layer.bold = true;
+            n.layer.box = BoxStyle::Solid; // no shadow
+            n.layer.padding = 0;
+            n.layer.color = 0xffb8bfcc;
+            n.w = kLabelW;
+            n.h = kLabelH;
+            n.canvas_h = kLabelH;
+            n.key = label_key(l.source);
+            want(n);
+        }
+    }
+    return out;
+}
+
+void Studio::put_raster(uint64_t key, const std::vector<uint32_t> &pixels, int w, int h) {
+    if (!dev_ || pixels.size() != (size_t) w * (size_t) h || w <= 0 || h <= 0 || cache_.count(key)) {
+        return;
+    }
+    if (cache_.size() >= 96) {
+        // Forget the pictures drawn longest ago; a scene that needs one again simply has it redrawn.
+        std::vector<std::pair<uint64_t, uint64_t>> age;
+        for (auto &e : cache_) {
+            age.push_back({e.second.used, e.first});
+        }
+        std::sort(age.begin(), age.end());
+        for (size_t i = 0; i < 32 && i < age.size(); ++i) {
+            auto &c = cache_[age[i].second];
+            release(c.srv);
+            release(c.tex);
+            cache_.erase(age[i].second);
+        }
+    }
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = (UINT) w;
+    td.Height = (UINT) h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA srd = {pixels.data(), (UINT) w * 4, 0};
+    Cached c;
+    c.w = w;
+    c.h = h;
+    c.used = frame_;
+    if (SUCCEEDED(dev_->CreateTexture2D(&td, &srd, &c.tex)) &&
+        SUCCEEDED(dev_->CreateShaderResourceView(c.tex, nullptr, &c.srv))) {
+        cache_[key] = c;
+    } else {
+        release(c.tex);
+    }
+}
+
+const Studio::Cached *Studio::cached(uint64_t key) {
+    auto it = cache_.find(key);
+    if (it == cache_.end()) {
+        return nullptr;
+    }
+    it->second.used = frame_;
+    return &it->second;
 }
 
 bool Studio::init(ID3D11Device *device, ID3D11DeviceContext *ctx) {
@@ -402,8 +535,9 @@ bool Studio::init(ID3D11Device *device, ID3D11DeviceContext *ctx) {
     struct {
         const char *src;
         ID3D11PixelShader **out;
-    } shaders[] = {{kPsBg, &ps_bg_},     {kPsBlur, &ps_blur_}, {kPsCard, &ps_card_}, {kPsTex, &ps_tex_},
-                   {kPsFade, &ps_fade_}, {kPsY, &ps_y_},       {kPsUv, &ps_uv_},     {kPsImg, &ps_img_}};
+    } shaders[] = {{kPsBg, &ps_bg_},     {kPsBlur, &ps_blur_}, {kPsCard, &ps_card_}, {kPsRect, &ps_rect_},
+                   {kPsBox, &ps_box_},   {kPsFade, &ps_fade_}, {kPsY, &ps_y_},       {kPsUv, &ps_uv_},
+                   {kPsImg, &ps_img_}};
     for (auto &s : shaders) {
         std::string code = std::string(kCommon) + s.src;
         if (FAILED(D3DCompile(code.data(), code.size(), "studio_ps", nullptr, nullptr, "main", "ps_4_0",
@@ -455,29 +589,28 @@ bool Studio::init(ID3D11Device *device, ID3D11DeviceContext *ctx) {
     D3D11_RASTERIZER_DESC rd = {};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
+    rd.ScissorEnable = TRUE;
     dev_->CreateRasterizerState(&rd, &raster_);
-    return vs_ && layout_ && vb_ && cb_ && sampler_ && blend_alpha_ && blend_premult_;
+    return vs_ && layout_ && vb_ && cb_ && sampler_ && blend_alpha_ && blend_premult_ && raster_;
 }
 
 void Studio::shutdown() {
-    for (int i = 0; i < kSceneCount; ++i) {
-        release(overlay_srv_[i]);
-        release(overlay_[i]);
+    for (auto &e : cache_) {
+        release(e.second.srv);
+        release(e.second.tex);
     }
-    release(canvas_srv_);
-    release(canvas_rtv_);
-    release(canvas_);
+    cache_.clear();
+    free_target(canvas_);
+    free_target(preview_);
     release(snap_srv_);
     release(snap_);
     release(y_rtv_);
     release(y_);
     release(uv_rtv_);
     release(uv_);
-    for (auto **ps : {&ps_bg_, &ps_blur_, &ps_card_, &ps_tex_, &ps_fade_, &ps_y_, &ps_uv_, &ps_img_}) {
+    for (auto **ps : {&ps_bg_, &ps_blur_, &ps_card_, &ps_rect_, &ps_box_, &ps_fade_, &ps_y_, &ps_uv_, &ps_img_}) {
         release(*ps);
     }
-    release(bg_srv_);
-    release(bg_);
     release(vs_);
     release(layout_);
     release(vb_);
@@ -492,8 +625,8 @@ void Studio::shutdown() {
     ctx_ = nullptr;
 }
 
-bool Studio::make_target(int w, int h, DXGI_FORMAT fmt, bool mips, ID3D11Texture2D **tex,
-                         ID3D11RenderTargetView **rtv, ID3D11ShaderResourceView **srv) {
+bool Studio::make_texture(int w, int h, DXGI_FORMAT fmt, bool mips, bool rt, ID3D11Texture2D **tex,
+                          ID3D11RenderTargetView **rtv, ID3D11ShaderResourceView **srv) {
     int levels = 1;
     if (mips) {
         for (int m = (std::max)(w, h); m > 1; m >>= 1) {
@@ -508,7 +641,7 @@ bool Studio::make_target(int w, int h, DXGI_FORMAT fmt, bool mips, ID3D11Texture
     td.Format = fmt;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
-    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | (rt || mips ? D3D11_BIND_RENDER_TARGET : 0);
     td.MiscFlags = mips ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
     if (FAILED(dev_->CreateTexture2D(&td, nullptr, tex))) {
         return false;
@@ -527,29 +660,53 @@ bool Studio::make_target(int w, int h, DXGI_FORMAT fmt, bool mips, ID3D11Texture
     return true;
 }
 
+bool Studio::make_target(Target &t, int w, int h) {
+    free_target(t);
+    const DXGI_FORMAT rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (!make_texture(w, h, rgba, true, true, &t.tex, &t.rtv, &t.srv) ||
+        !make_texture(w, h, rgba, true, true, &t.behind, nullptr, &t.behind_srv)) {
+        free_target(t);
+        return false;
+    }
+    t.w = w;
+    t.h = h;
+    return true;
+}
+
+void Studio::free_target(Target &t) {
+    release(t.srv);
+    release(t.rtv);
+    release(t.tex);
+    release(t.behind_srv);
+    release(t.behind);
+    t.w = t.h = 0;
+}
+
 bool Studio::set_canvas_size(int w, int h) {
     w &= ~1;
     h &= ~1;
-    if (w == cw_ && h == ch_ && canvas_) {
+    if (w == cw_ && h == ch_ && canvas_.tex) {
         return true;
     }
-    release(canvas_srv_);
-    release(canvas_rtv_);
-    release(canvas_);
+    free_target(canvas_);
     release(snap_srv_);
     release(snap_);
     release(y_rtv_);
     release(y_);
     release(uv_rtv_);
     release(uv_);
+    for (auto &e : cache_) { // every text picture is drawn at canvas size
+        release(e.second.srv);
+        release(e.second.tex);
+    }
+    cache_.clear();
     cw_ = ch_ = 0;
     rendered_ = false;
     fading_ = false;
-    const DXGI_FORMAT rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
-    if (!make_target(w, h, rgba, true, &canvas_, &canvas_rtv_, &canvas_srv_) ||
-        !make_target(w, h, rgba, true, &snap_, nullptr, &snap_srv_) ||
-        !make_target(w, h, DXGI_FORMAT_R8_UNORM, false, &y_, &y_rtv_, nullptr) ||
-        !make_target(w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, false, &uv_, &uv_rtv_, nullptr)) {
+    if (!make_target(canvas_, w, h) ||
+        !make_texture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, true, true, &snap_, nullptr, &snap_srv_) ||
+        !make_texture(w, h, DXGI_FORMAT_R8_UNORM, false, true, &y_, &y_rtv_, nullptr) ||
+        !make_texture(w / 2, h / 2, DXGI_FORMAT_R8G8_UNORM, false, true, &uv_, &uv_rtv_, nullptr)) {
         append_log("studio: could not create the canvas");
         return false;
     }
@@ -562,70 +719,55 @@ bool Studio::set_canvas_size(int w, int h) {
     return true;
 }
 
-void Studio::set_overlay(Scene scene, const std::vector<uint32_t> &pixels, int w, int h) {
-    release(overlay_srv_[scene]);
-    release(overlay_[scene]);
-    if (pixels.size() != (size_t) w * (size_t) h || w <= 0 || h <= 0) {
-        return;
+bool Studio::set_preview_size(int w, int h) {
+    if (w == preview_.w && h == preview_.h && preview_.tex) {
+        return true;
     }
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = (UINT) w;
-    td.Height = (UINT) h;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_IMMUTABLE;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA srd = {pixels.data(), (UINT) w * 4, 0};
-    if (SUCCEEDED(dev_->CreateTexture2D(&td, &srd, &overlay_[scene]))) {
-        dev_->CreateShaderResourceView(overlay_[scene], nullptr, &overlay_srv_[scene]);
+    if (w <= 0 || h <= 0) {
+        free_target(preview_);
+        return true;
     }
+    if (!make_target(preview_, w, h)) {
+        return false;
+    }
+    preview_mips_ = 1;
+    for (int m = (std::max)(w, h); m > 1; m >>= 1) {
+        ++preview_mips_;
+    }
+    return true;
 }
 
-void Studio::set_background_image(const std::vector<uint32_t> &pixels, int w, int h) {
-    release(bg_srv_);
-    release(bg_);
-    if (pixels.size() != (size_t) w * (size_t) h || w <= 0 || h <= 0) {
-        return;
-    }
-    D3D11_TEXTURE2D_DESC td = {};
-    td.Width = (UINT) w;
-    td.Height = (UINT) h;
-    td.MipLevels = 1;
-    td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage = D3D11_USAGE_IMMUTABLE;
-    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA srd = {pixels.data(), (UINT) w * 4, 0};
-    if (SUCCEEDED(dev_->CreateTexture2D(&td, &srd, &bg_))) {
-        dev_->CreateShaderResourceView(bg_, nullptr, &bg_srv_);
-    }
-}
-
-void Studio::set_scene(Scene scene, double now_s) {
-    if (scene == scene_) {
-        return;
-    }
-    if (rendered_ && snap_ && canvas_) {
-        ctx_->CopyResource(snap_, canvas_); // fade from exactly what was last shown, mid-fade included
+void Studio::set_scene(const Scene &scene, double now_s, double fade_s) {
+    if (fade_s > 0 && rendered_ && snap_ && canvas_.tex) {
+        ctx_->CopyResource(snap_, canvas_.tex); // fade from exactly what was last shown, mid-fade included
         fading_ = true;
         fade_start_ = now_s;
+        fade_len_ = fade_s;
     }
-    scene_ = scene;
+    live_ = scene;
 }
 
 bool Studio::animating(double now_s) const {
-    return (fading_ && now_s - fade_start_ < kFadeSeconds + 0.05) || scene_ != Screen;
+    if (fading_ && now_s - fade_start_ < fade_len_ + 0.05) {
+        return true;
+    }
+    if (live_.backdrop != Backdrop::Colors) {
+        return false;
+    }
+    for (auto &l : live_.layers) {
+        if (l.type == LayerType::Source && l.visible) {
+            return false; // behind a screen the field holds still: only new video needs a new frame
+        }
+    }
+    return true; // a title card's drifting background
 }
 
-void Studio::set_cb(ID3D11Buffer *cb, const float *data, size_t floats) {
+void Studio::set_cb(const float *data, size_t floats) {
     D3D11_MAPPED_SUBRESOURCE map = {};
-    if (SUCCEEDED(ctx_->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+    if (SUCCEEDED(ctx_->Map(cb_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
         memset(map.pData, 0, 16 * 16);
         memcpy(map.pData, data, (std::min)(floats, (size_t) 64) * sizeof(float));
-        ctx_->Unmap(cb, 0);
+        ctx_->Unmap(cb_, 0);
     }
 }
 
@@ -635,17 +777,23 @@ void Studio::viewport(int w, int h) {
     vp.Height = (float) h;
     vp.MaxDepth = 1;
     ctx_->RSSetViewports(1, &vp);
+    D3D11_RECT r = {0, 0, w, h};
+    ctx_->RSSetScissorRects(1, &r);
 }
 
-void Studio::draw(ID3D11PixelShader *ps, ID3D11ShaderResourceView *srv, ID3D11Buffer *cb, bool blend,
-                  bool premult) {
+void Studio::scissor(float x0, float y0, float x1, float y1) {
+    D3D11_RECT r = {(LONG) std::floor(x0), (LONG) std::floor(y0), (LONG) std::ceil(x1), (LONG) std::ceil(y1)};
+    ctx_->RSSetScissorRects(1, &r);
+}
+
+void Studio::draw(ID3D11PixelShader *ps, ID3D11ShaderResourceView *srv, bool blend, bool premult) {
     UINT stride = 16, offset = 0;
     ctx_->IASetInputLayout(layout_);
     ctx_->IASetVertexBuffers(0, 1, &vb_, &stride, &offset);
     ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     ctx_->VSSetShader(vs_, nullptr, 0);
     ctx_->PSSetShader(ps, nullptr, 0);
-    ctx_->PSSetConstantBuffers(0, 1, &cb);
+    ctx_->PSSetConstantBuffers(0, 1, &cb_);
     ctx_->PSSetSamplers(0, 1, &sampler_);
     ctx_->PSSetShaderResources(0, 1, &srv);
     ctx_->RSSetState(raster_);
@@ -657,10 +805,82 @@ void Studio::draw(ID3D11PixelShader *ps, ID3D11ShaderResourceView *srv, ID3D11Bu
     ctx_->OMSetBlendState(nullptr, factor, 0xffffffff);
 }
 
-void Studio::draw_scene(Scene scene, ID3D11ShaderResourceView *src, int src_w, int src_h, int src_mips,
-                        double now_s) {
-    const float W = (float) cw_, H = (float) ch_;
-    auto field = [&](Scene mood, bool still = false) {
+void Studio::draw_texture(const Cached &c, float x, float y, float w, float h, float opacity) {
+    float k[8] = {x, y, w, h, opacity, 0, 0, 0};
+    set_cb(k, 8);
+    scissor(x, y, x + w, y + h);
+    draw(ps_rect_, c.srv, true, true);
+}
+
+// A text layer's box or a frame: fill per the layer's box style, plus (frames, outlines) a border.
+void Studio::draw_box(const Layer &l, Target &t, float x, float y, float w, float h, bool is_text) {
+    const float H = (float) t.h;
+    float k[24] = {x, y, w, h, l.radius * H, 0, 0, l.opacity};
+    int mode = 3;
+    if (l.has_box()) {
+        switch (l.box) {
+        case BoxStyle::Solid:
+            mode = 0;
+            argb(l.box_color, 1.f, k + 8);
+            break;
+        case BoxStyle::Translucent:
+            mode = 0;
+            argb(l.box_color, l.box_opacity, k + 8);
+            break;
+        case BoxStyle::Gradient:
+            mode = 1;
+            argb(l.box_color, l.box_opacity, k + 8);
+            argb(l.box_color2, l.box_opacity, k + 12);
+            break;
+        case BoxStyle::Blur:
+            mode = 2;
+            argb(l.box_color, l.box_opacity * 0.6f, k + 8);
+            break;
+        default: // Outline
+            mode = 3;
+            break;
+        }
+    }
+    if (is_text) {
+        if (mode == 3) {
+            if (!l.has_box()) {
+                return;
+            }
+            k[5] = (std::max)(1.f, H * 0.0025f); // outline: a hairline in the box colour
+            argb(l.box_color, (std::max)(l.box_opacity, 0.35f), k + 16);
+        }
+    } else {
+        k[5] = l.thickness * H; // a frame's border
+        argb(l.color, (float) (l.color >> 24) / 255.f, k + 16);
+        if (mode == 3 && k[5] <= 0) {
+            return;
+        }
+    }
+    k[6] = (float) mode;
+    ID3D11ShaderResourceView *srv = nullptr;
+    if (mode == 2) {
+        // Frosted glass: blur whatever has been drawn so far, only inside the box.
+        ID3D11RenderTargetView *none = nullptr;
+        ctx_->OMSetRenderTargets(1, &none, nullptr);
+        ctx_->CopyResource(t.behind, t.tex);
+        ctx_->GenerateMips(t.behind_srv);
+        ctx_->OMSetRenderTargets(1, &t.rtv, nullptr);
+        float lod = 1.f + l.blur * 4.f;
+        k[20] = lod;
+        k[21] = 1.f / (float) t.w;
+        k[22] = 1.f / (float) t.h;
+        k[23] = std::exp2(lod) * 1.2f;
+        srv = t.behind_srv;
+    }
+    set_cb(k, 24);
+    scissor(x - 1, y - 1, x + w + 1, y + h + 1);
+    draw(ps_box_, srv, true, false);
+}
+
+void Studio::draw_scene(const Scene &scene, const Sources &src, Target &t, double now_s, bool preview) {
+    const float W = (float) t.w, H = (float) t.h;
+    auto full = [&] { scissor(0, 0, W, H); };
+    auto field = [&](int mood, bool still) {
         Palette p = palette(mood);
         float c[20];
         memcpy(c, p.top, 16);
@@ -671,97 +891,183 @@ void Studio::draw_scene(Scene scene, ID3D11ShaderResourceView *src, int src_w, i
         c[17] = W;
         c[18] = H;
         c[19] = 0;
-        set_cb(cb_, c, 20);
-        draw(ps_bg_, nullptr, cb_, false, false);
+        set_cb(c, 20);
+        draw(ps_bg_, nullptr, false, false);
     };
 
-    auto picture = [&](float dim) {
-        float c[4] = {dim, 0, 0, 0};
-        set_cb(cb_, c, 4);
-        draw(ps_img_, bg_srv_, cb_, false, false);
-    };
-    bool use_image = background_ == Image && bg_srv_;
-
-    if (scene != Screen) {
-        if (use_image) {
-            picture(0.55f); // dark enough for white title text over any photo
+    // 1. The backdrop.
+    const Layer *main_screen = nullptr;
+    for (auto &l : scene.layers) {
+        if (l.type == LayerType::Source && l.visible && !main_screen) {
+            main_screen = &l;
+        }
+    }
+    full();
+    switch (scene.backdrop) {
+    case Backdrop::Solid: {
+        float col[4];
+        argb(scene.bg_color, 1, col);
+        ctx_->ClearRenderTargetView(t.rtv, col);
+        break;
+    }
+    case Backdrop::Image: {
+        const Cached *c = scene.bg_image.empty() ? nullptr : cached(picture_key(scene.bg_image, cw_, ch_, true));
+        if (c) {
+            float k[4] = {1, 0, 0, 0};
+            set_cb(k, 4);
+            draw(ps_img_, c->srv, false, false);
         } else {
-            field(scene);
+            field(scene.mood, true);
         }
-        if (overlay_srv_[scene]) {
-            draw(ps_tex_, overlay_srv_[scene], cb_, true, true);
-        }
-        return;
+        break;
     }
-
-    bool have = src && src_w > 0 && src_h > 0;
-    if (!framed_) {
-        float black[4] = {0, 0, 0, 1};
-        ctx_->ClearRenderTargetView(canvas_rtv_, black);
-    } else if (use_image) {
-        picture(0.9f);
-    } else if (background_ == Blur && have) {
-        // Ambient backdrop: the picture itself, blurred down to colour and dimmed, covering the canvas.
-        float sa = (float) src_w / (float) src_h, ca = W / H;
-        float sx = 1, sy = 1;
-        if (sa > ca) {
-            sx = ca / sa;
+    case Backdrop::Blur: {
+        const Source *s = main_screen ? &src.get(main_screen->source) : nullptr;
+        if (s && s->srv && s->w > 0 && s->h > 0) {
+            // Ambient backdrop: the main screen itself, blurred down to colour and dimmed, covering the canvas.
+            float sa = (float) s->w / (float) s->h, ca = W / H;
+            float sx = 1, sy = 1;
+            if (sa > ca) {
+                sx = ca / sa;
+            } else {
+                sy = sa / ca;
+            }
+            sx /= 1.15f; // zoom in a little so the softened edges stay off the canvas
+            sy /= 1.15f;
+            int lod = std::clamp((int) std::floor(std::log2((float) s->w / 28.f)), 0, s->mips - 1);
+            float tw = (float) (std::max)(1, s->w >> lod), th = (float) (std::max)(1, s->h >> lod);
+            float c[8] = {sx, sy, (1 - sx) * 0.5f, (1 - sy) * 0.5f, (float) lod, 1.f / tw, 1.f / th, 0.32f};
+            set_cb(c, 8);
+            draw(ps_blur_, s->srv, false, false);
         } else {
-            sy = sa / ca;
+            field(scene.mood, true);
         }
-        sx /= 1.15f; // zoom in a little so the softened edges stay off the canvas
-        sy /= 1.15f;
-        int lod = std::clamp((int) std::floor(std::log2((float) src_w / 28.f)), 0, src_mips - 1);
-        float tw = (float) (std::max)(1, src_w >> lod), th = (float) (std::max)(1, src_h >> lod);
-        float c[8] = {sx, sy, (1 - sx) * 0.5f, (1 - sy) * 0.5f, (float) lod, 1.f / tw, 1.f / th, 0.32f};
-        set_cb(cb_, c, 8);
-        draw(ps_blur_, src, cb_, false, false);
-    } else {
-        field(Screen, true); // held still: the Screen scene only redraws when the picture changes
+        break;
     }
-    if (!have) {
-        return;
+    default:
+        field(scene.mood, main_screen != nullptr || preview);
+        break;
     }
 
-    // The picture, fitted inside the margin; framed gets rounded corners and a shadow.
-    float margin = framed_ ? H * 0.06f : 0.f;
-    float bw = W - margin * 2, bh = H - margin * 2;
-    float sa = (float) src_w / (float) src_h;
-    float rw = bw, rh = bw / sa;
-    if (rh > bh) {
-        rh = bh;
-        rw = bh * sa;
+    // 2. The layers, back to front.
+    for (auto &l : scene.layers) {
+        if (!l.visible || l.opacity <= 0.001f) {
+            continue;
+        }
+        float lx = l.x * W, ly = l.y * H, lw = l.w * W, lh = l.h * H;
+        switch (l.type) {
+        case LayerType::Source: {
+            const Source &s = src.get(l.source);
+            if (!s.srv || s.w <= 0 || s.h <= 0) {
+                if (preview) {
+                    // A stand-in so the layout can be arranged before anything is connected.
+                    Layer ph;
+                    ph.box = BoxStyle::Translucent;
+                    ph.box_color = 0xff262b36;
+                    ph.box_opacity = 0.92f;
+                    ph.radius = l.rounded ? (std::min)(l.w * W, l.h * H) * 0.035f / H : 0;
+                    ph.thickness = 1.5f / H;
+                    ph.color = 0xff5a6273;
+                    draw_box(ph, t, lx, ly, lw, lh, false);
+                    if (const Cached *c = cached(label_key(l.source))) {
+                        float bw = (std::min)(lw * 0.8f, lh * 0.8f * (float) kLabelW / (float) kLabelH);
+                        float bh = bw * (float) kLabelH / (float) kLabelW;
+                        draw_texture(*c, lx + (lw - bw) / 2, ly + (lh - bh) / 2, bw, bh, 1.f);
+                    }
+                }
+                break;
+            }
+            float sa = (float) s.w / (float) s.h;
+            float rx = lx, ry = ly, rw = lw, rh = lh;
+            float us = 1, vs = 1, uo = 0, vo = 0;
+            if (l.fill) {
+                float la = lw / lh;
+                if (sa > la) {
+                    us = la / sa;
+                    uo = (1 - us) * 0.5f;
+                } else {
+                    vs = sa / la;
+                    vo = (1 - vs) * 0.5f;
+                }
+            } else {
+                rw = lw;
+                rh = lw / sa;
+                if (rh > lh) {
+                    rh = lh;
+                    rw = lh * sa;
+                }
+                rx = std::floor(lx + (lw - rw) * 0.5f);
+                ry = std::floor(ly + (lh - rh) * 0.5f);
+            }
+            float scale = (std::min)(rw / ((float) s.w * us), rh / ((float) s.h * vs));
+            int lod = scale < 1.f ? (std::min)((int) std::floor(std::log2(1.f / scale)), s.mips - 1) : 0;
+            float radius = l.rounded ? (std::min)(rw, rh) * 0.035f : 0.f;
+            float shadow = l.rounded ? H * 0.035f : 0.f;
+            float c[16] = {rx, ry, rw, rh, radius, shadow, (float) lod, l.opacity,
+                           (float) (std::max)(1, s.w >> lod), (float) (std::max)(1, s.h >> lod), 0, 0,
+                           us, vs, uo, vo};
+            set_cb(c, 16);
+            scissor(rx - shadow * 1.5f, ry - shadow * 1.5f, rx + rw + shadow * 1.5f, ry + rh + shadow * 1.5f);
+            draw(ps_card_, s.srv, true, false);
+            break;
+        }
+        case LayerType::Text: {
+            draw_box(l, t, lx, ly, lw, lh, true);
+            int pw, ph;
+            layer_pixels(l, cw_, ch_, pw, ph);
+            if (const Cached *c = l.text.empty() ? nullptr : cached(text_key(l, pw, ph, ch_))) {
+                draw_texture(*c, lx, ly, lw, lh, l.opacity);
+            }
+            break;
+        }
+        case LayerType::Image: {
+            int pw, ph;
+            layer_pixels(l, cw_, ch_, pw, ph);
+            if (const Cached *c = l.path.empty() ? nullptr : cached(picture_key(l.path, pw, ph, false))) {
+                draw_texture(*c, lx, ly, lw, lh, l.opacity);
+            }
+            break;
+        }
+        case LayerType::Frame:
+            draw_box(l, t, lx, ly, lw, lh, false);
+            break;
+        }
     }
-    float rx = std::floor((W - rw) * 0.5f), ry = std::floor((H - rh) * 0.5f);
-    float scale = (std::min)(rw / (float) src_w, rh / (float) src_h);
-    int lod = scale < 1.f ? (std::min)((int) std::floor(std::log2(1.f / scale)), src_mips - 1) : 0;
-    float radius = framed_ ? (std::min)(rw, rh) * 0.035f : 0.f;
-    float shadow = framed_ ? H * 0.035f : 0.f;
-    float c[12] = {rx, ry, rw, rh, radius, shadow, (float) lod, 0,
-                   (float) (std::max)(1, src_w >> lod), (float) (std::max)(1, src_h >> lod), 0, 0};
-    set_cb(cb_, c, 12);
-    draw(ps_card_, src, cb_, true, false);
-    if (overlay_srv_[Screen]) {
-        draw(ps_tex_, overlay_srv_[Screen], cb_, true, true); // the caption, if one is set
-    }
+    full();
 }
 
-void Studio::render(ID3D11ShaderResourceView *src, int src_w, int src_h, int src_mips, double now_s) {
-    if (!canvas_) {
+void Studio::draw_marks(const std::vector<Mark> &marks, const Target &t) {
+    const float W = (float) t.w, H = (float) t.h;
+    for (auto &m : marks) {
+        float x = m.x * W - m.grow_px, y = m.y * H - m.grow_px;
+        float w = m.w * W + m.grow_px * 2, h = m.h * H + m.grow_px * 2;
+        float k[20] = {x, y, w, h, 0, m.border_px, m.border_px > 0 ? 3.f : 0.f, 1};
+        argb(m.color, (float) (m.color >> 24) / 255.f, k + 8);
+        argb(m.color, (float) (m.color >> 24) / 255.f, k + 16);
+        set_cb(k, 20);
+        scissor(x - 1, y - 1, x + w + 1, y + h + 1);
+        draw(ps_box_, nullptr, true, false);
+    }
+    scissor(0, 0, W, H);
+}
+
+void Studio::render(const Sources &src, double now_s) {
+    if (!canvas_.tex) {
         return;
     }
+    ++frame_;
     viewport(cw_, ch_);
-    ctx_->OMSetRenderTargets(1, &canvas_rtv_, nullptr);
-    draw_scene(scene_, src, src_w, src_h, src_mips, now_s);
+    ctx_->OMSetRenderTargets(1, &canvas_.rtv, nullptr);
+    draw_scene(live_, src, canvas_, now_s, false);
     if (fading_) {
-        double p = (now_s - fade_start_) / kFadeSeconds;
+        double p = (now_s - fade_start_) / fade_len_;
         if (p >= 1) {
             fading_ = false;
         } else {
             float e = (float) (p * p * (3 - 2 * p)); // ease in-out
-            float c[4] = {1.f - e, 1.f + 0.035f * e, 0, 0};
-            set_cb(cb_, c, 4);
-            draw(ps_fade_, snap_srv_, cb_, true, false);
+            float c[4] = {1.f - e, 1.f + 0.035f * e * (float) (fade_len_ / 0.5), 0, 0};
+            set_cb(c, 4);
+            draw(ps_fade_, snap_srv_, true, false);
         }
     }
     ID3D11RenderTargetView *none = nullptr;
@@ -769,18 +1075,31 @@ void Studio::render(ID3D11ShaderResourceView *src, int src_w, int src_h, int src
     rendered_ = true;
 }
 
+void Studio::render_preview(const Scene &scene, const Sources &src, const std::vector<Mark> &marks, double now_s) {
+    if (!preview_.tex || cw_ <= 0) {
+        return;
+    }
+    ++frame_;
+    viewport(preview_.w, preview_.h);
+    ctx_->OMSetRenderTargets(1, &preview_.rtv, nullptr);
+    draw_scene(scene, src, preview_, now_s, true);
+    draw_marks(marks, preview_);
+    ID3D11RenderTargetView *none = nullptr;
+    ctx_->OMSetRenderTargets(1, &none, nullptr);
+}
+
 bool Studio::export_planes(ID3D11Texture2D **y, ID3D11Texture2D **uv) {
-    if (!canvas_ || !y_ || !uv_) {
+    if (!canvas_.tex || !y_ || !uv_) {
         return false;
     }
     float c[4] = {};
-    set_cb(cb_, c, 4);
+    set_cb(c, 4);
     viewport(cw_, ch_);
     ctx_->OMSetRenderTargets(1, &y_rtv_, nullptr);
-    draw(ps_y_, canvas_srv_, cb_, false, false);
+    draw(ps_y_, canvas_.srv, false, false);
     viewport(cw_ / 2, ch_ / 2);
     ctx_->OMSetRenderTargets(1, &uv_rtv_, nullptr);
-    draw(ps_uv_, canvas_srv_, cb_, false, false);
+    draw(ps_uv_, canvas_.srv, false, false);
     ID3D11RenderTargetView *none = nullptr;
     ctx_->OMSetRenderTargets(1, &none, nullptr);
     *y = y_;

@@ -131,6 +131,12 @@ add_executable(AirScreen WIN32
     src/recorder.cpp
     src/mic.cpp
     src/studio.cpp
+    src/scene.cpp
+    src/capture.cpp
+    src/teach.cpp
+    src/control.cpp
+    src/editor.cpp
+    src/dialogs.cpp
     src/settings.cpp
     src/ui.cpp
     src/openssl_applink.c
@@ -159,12 +165,17 @@ target_link_libraries(AirScreen PRIVATE
     dwmapi
     gdiplus
     avrt
+    windowsapp
+    uxtheme
 )
 if (MSVC)
     set_source_files_properties(
         src/main.cpp src/receiver.cpp src/video.cpp src/audio.cpp src/recorder.cpp src/mic.cpp src/studio.cpp src/settings.cpp
         PROPERTIES COMPILE_OPTIONS "/utf-8;/W3;/wd4996;/FI${COMPAT_DIR}/airscreen_types.h")
-    set_source_files_properties(src/ui.cpp PROPERTIES COMPILE_OPTIONS "/utf-8;/W3")
+    set_source_files_properties(src/ui.cpp src/scene.cpp src/teach.cpp src/control.cpp src/editor.cpp src/dialogs.cpp
+        PROPERTIES COMPILE_OPTIONS "/utf-8;/W3")
+    # Windows.Graphics.Capture through C++/WinRT.
+    set_source_files_properties(src/capture.cpp PROPERTIES COMPILE_OPTIONS "/utf-8;/W3;/bigobj")
     # Keep OPENSSL_Applink in the EXE export table (OpenSSL GetProcAddress).
     target_link_options(AirScreen PRIVATE /MANIFEST:NO /EXPORT:OPENSSL_Applink)
 endif()

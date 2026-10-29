@@ -25,6 +25,8 @@ enum class UiEvent {
     VideoReady,
     ClientName,
     RecordingStopped, // message: error text, empty when the clip closed cleanly
+    ComputerReady,    // the computer screen's first picture arrived
+    ComputerClosed,   // the shared window closed or the display went away
 };
 
 class Receiver {

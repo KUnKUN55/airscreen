@@ -159,7 +159,7 @@ bool VideoPipeline::init(HWND hwnd) {
         if (!create_device()) {
             return false;
         }
-        if (!create_swapchain()) {
+        if (!create_swapchain(hwnd_, true, &swapchain_, &rtv_)) {
             return false;
         }
         if (!create_pipeline()) {
@@ -200,10 +200,18 @@ void VideoPipeline::start_worker() {
 }
 
 void VideoPipeline::shutdown() {
+    capture_.stop(); // before taking mu_: a frame being handed over holds the capture's lock and wants mu_
     stop_worker();
     std::lock_guard<std::mutex> lock(mu_);
     decode_close();
     studio_.shutdown();
+    comp_live_ = false;
+    release(comp_srv_);
+    release(comp_);
+    comp_w_ = comp_h_ = 0;
+    release(preview_rtv_);
+    release(preview_sc_);
+    preview_hwnd_ = nullptr;
     if (staging_) {
         staging_->Release();
         staging_ = nullptr;
@@ -295,7 +303,6 @@ void VideoPipeline::resize() {
     if (FAILED(hr)) {
         return;
     }
-    present_cw_ = present_ch_ = 0;
     ID3D11Texture2D *back = nullptr;
     if (SUCCEEDED(swapchain_->GetBuffer(0, IID_PPV_ARGS(&back)))) {
         device_->CreateRenderTargetView(back, nullptr, &rtv_);
@@ -322,6 +329,10 @@ void VideoPipeline::clear() {
     }
     std::lock_guard<std::mutex> lock(mu_);
     has_frame_ = false;
+    if (comp_live_.load()) {
+        request_render(); // the computer screen carries the scene on its own
+        return;
+    }
     studio_.reset();
     if (rtv_ && ctx_ && swapchain_) {
         float black[4] = {0.07f, 0.08f, 0.10f, 1};
@@ -348,82 +359,226 @@ void VideoPipeline::request_render() {
     render_cv_.notify_one();
 }
 
-void VideoPipeline::set_scene(int scene) {
+// Draws the text and pictures `scene` needs that aren't cached yet. GDI+ runs here, off the D3D lock; only the
+// upload takes it.
+void VideoPipeline::prepare(const Scene &scene, bool preview) {
+    std::vector<Studio::Need> needs;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (!device_ || scene < 0 || scene >= Studio::kSceneCount) {
+        if (!device_) {
             return;
         }
-        studio_.set_scene((Studio::Scene) scene, (double) now_us() / 1e6);
+        needs = studio_.needs(scene, preview);
     }
-    request_render();
-}
-
-int VideoPipeline::scene() {
+    if (needs.empty()) {
+        return;
+    }
+    std::vector<std::vector<uint32_t>> px(needs.size());
+    for (size_t i = 0; i < needs.size(); ++i) {
+        px[i] = Studio::make_raster(needs[i]);
+    }
     std::lock_guard<std::mutex> lock(mu_);
-    return studio_.scene();
+    if (!device_) {
+        return;
+    }
+    for (size_t i = 0; i < needs.size(); ++i) {
+        studio_.put_raster(needs[i].key, px[i], needs[i].w, needs[i].h);
+    }
 }
 
-void VideoPipeline::set_framed(bool framed) {
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        studio_.set_framed(framed);
-    }
-    request_render();
-}
-
-bool VideoPipeline::set_background(int mode, const std::wstring &image_path) {
-    bg_mode_ = std::clamp(mode, 0, 2);
-    bg_path_ = image_path;
-    int cw, ch;
-    {
-        std::lock_guard<std::mutex> lock(mu_);
-        cw = studio_.canvas_w();
-        ch = studio_.canvas_h();
-    }
-    // Decoded and scaled here, off the D3D lock: a large photo takes a moment.
-    std::vector<uint32_t> px;
-    if (bg_mode_ == Studio::Image) {
-        px = Studio::load_cover(bg_path_, cw, ch);
-    }
-    bool ok = bg_mode_ != Studio::Image || !px.empty();
+void VideoPipeline::set_scene(const Scene &scene, double fade_s) {
+    prepare(scene, false);
     {
         std::lock_guard<std::mutex> lock(mu_);
         if (!device_) {
-            return ok;
+            return;
         }
-        studio_.set_background_image(px, cw, ch);
-        studio_.set_background(ok ? (Studio::Background) bg_mode_ : Studio::Colors);
+        studio_.set_scene(scene, (double) now_us() / 1e6, fade_s);
     }
     request_render();
-    return ok;
 }
 
-void VideoPipeline::set_studio(int canvas_h, const std::vector<std::wstring> &texts) {
+void VideoPipeline::set_canvas(int canvas_h) {
     int ch = std::clamp(canvas_h, 360, 2160) & ~1;
     int cw = (ch * 16 / 9) & ~1;
-    // The title cards are drawn with GDI+ here, off the D3D lock, then uploaded in one go.
-    std::vector<uint32_t> px[Studio::kSceneCount];
-    for (int s = 0; s < Studio::kSceneCount; ++s) {
-        Studio::Text t;
-        if ((size_t) s * 2 + 1 < texts.size()) {
-            t.title = texts[(size_t) s * 2];
-            t.subtitle = texts[(size_t) s * 2 + 1];
-        }
-        px[s] = Studio::build_overlay((Studio::Scene) s, t, cw, ch);
-    }
+    Scene live, preview;
+    bool previewing;
     {
         std::lock_guard<std::mutex> lock(mu_);
-        if (!device_) {
+        if (!device_ || (studio_.canvas_w() == cw && studio_.canvas_h() == ch)) {
             return;
         }
         studio_.set_canvas_size(cw, ch);
-        for (int s = 0; s < Studio::kSceneCount; ++s) {
-            studio_.set_overlay((Studio::Scene) s, px[s], cw, ch);
-        }
+        live = studio_.scene();
+        preview = preview_scene_;
+        previewing = preview_sc_ != nullptr;
+        preview_dirty_ = true;
     }
-    if (bg_mode_ == Studio::Image) {
-        set_background(bg_mode_, bg_path_); // the picture is cut to the canvas size, so recut it
+    // Text is drawn at canvas size, so everything on show is drawn again for the new one.
+    prepare(live, false);
+    if (previewing) {
+        prepare(preview, true);
+    }
+    request_render();
+}
+
+bool VideoPipeline::start_computer(const CaptureTarget &target, bool cursor, int max_fps, std::string *err) {
+    stop_computer();
+    ID3D11Device *dev;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        dev = device_;
+    }
+    comp_interval_us_ = max_fps > 0 ? 1000000 / max_fps - 2000 : 0;
+    comp_last_us_ = 0;
+    return capture_.start(
+        dev, target, cursor, [this](ID3D11Texture2D *tex, int w, int h) { on_computer_frame(tex, w, h); },
+        [this] {
+            if (comp_closed_fn_) {
+                comp_closed_fn_();
+            }
+        },
+        err);
+}
+
+void VideoPipeline::stop_computer() {
+    capture_.stop(); // not under mu_ (see shutdown)
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        comp_live_ = false;
+        comp_dirty_ = false;
+        release(comp_srv_);
+        release(comp_);
+        comp_w_ = comp_h_ = 0;
+        preview_dirty_ = true;
+    }
+    request_render();
+}
+
+// Capture thread: copy the new picture over; the render thread rebuilds its mips and composes.
+void VideoPipeline::on_computer_frame(ID3D11Texture2D *tex, int w, int h) {
+    int64_t now = now_us();
+    if (comp_interval_us_ > 0 && now - comp_last_us_ < comp_interval_us_) {
+        return;
+    }
+    comp_last_us_ = now;
+    bool first;
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!device_ || !ctx_) {
+            return;
+        }
+        if (!comp_ || comp_w_ != w || comp_h_ != h) {
+            release(comp_srv_);
+            release(comp_);
+            int mips = 1;
+            for (int m = (std::max)(w, h); m > 1; m >>= 1) {
+                ++mips;
+            }
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = (UINT) w;
+            td.Height = (UINT) h;
+            td.MipLevels = (UINT) mips;
+            td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+            if (FAILED(device_->CreateTexture2D(&td, nullptr, &comp_)) ||
+                FAILED(device_->CreateShaderResourceView(comp_, nullptr, &comp_srv_))) {
+                release(comp_);
+                comp_w_ = comp_h_ = 0;
+                return;
+            }
+            comp_w_ = w;
+            comp_h_ = h;
+            comp_mips_ = mips;
+        }
+        D3D11_BOX box = {0, 0, 0, (UINT) w, (UINT) h, 1};
+        ctx_->CopySubresourceRegion(comp_, 0, 0, 0, 0, tex, 0, &box);
+        comp_dirty_ = true;
+        first = !comp_live_.exchange(true);
+    }
+    request_render();
+    if (first && comp_first_fn_) {
+        comp_first_fn_();
+    }
+}
+
+bool VideoPipeline::attach_preview(HWND hwnd) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!device_) {
+            return false;
+        }
+        release(preview_rtv_);
+        release(preview_sc_);
+        if (!create_swapchain(hwnd, false, &preview_sc_, &preview_rtv_)) {
+            release(preview_rtv_);
+            release(preview_sc_);
+            return false;
+        }
+        preview_hwnd_ = hwnd;
+        studio_.set_preview_size(1280, 720);
+        preview_dirty_ = true;
+    }
+    request_render();
+    return true;
+}
+
+void VideoPipeline::detach_preview() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (ctx_) {
+        ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+    }
+    release(preview_rtv_);
+    release(preview_sc_);
+    preview_hwnd_ = nullptr;
+    preview_marks_.clear();
+    if (device_) {
+        studio_.set_preview_size(0, 0); // the preview target is only kept while someone looks at it
+    }
+}
+
+void VideoPipeline::preview_resize() {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!preview_sc_ || !ctx_) {
+            return;
+        }
+        ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+        release(preview_rtv_);
+        if (FAILED(preview_sc_->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, 0))) {
+            return;
+        }
+        ID3D11Texture2D *back = nullptr;
+        if (SUCCEEDED(preview_sc_->GetBuffer(0, IID_PPV_ARGS(&back)))) {
+            device_->CreateRenderTargetView(back, nullptr, &preview_rtv_);
+            back->Release();
+        }
+        preview_dirty_ = true;
+    }
+    request_render();
+}
+
+void VideoPipeline::set_preview_mode(int mode, SourceKind source) {
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        preview_mode_ = mode;
+        preview_source_ = source;
+        preview_dirty_ = true;
+    }
+    request_render();
+}
+
+void VideoPipeline::set_preview_scene(const Scene &scene, const std::vector<Studio::Mark> &marks) {
+    prepare(scene, true);
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        preview_scene_ = scene;
+        preview_marks_ = marks;
+        preview_dirty_ = true;
     }
     request_render();
 }
@@ -461,7 +616,8 @@ bool VideoPipeline::create_device() {
     return true;
 }
 
-bool VideoPipeline::create_swapchain() {
+// `main` is the program window, which may tear for the lowest latency; the preview never does.
+bool VideoPipeline::create_swapchain(HWND hwnd, bool main, IDXGISwapChain1 **sc, ID3D11RenderTargetView **rtv) {
     ComPtr<IDXGIDevice> dxgi_dev;
     device_->QueryInterface(IID_PPV_ARGS(&dxgi_dev));
     ComPtr<IDXGIAdapter> adapter;
@@ -469,13 +625,16 @@ bool VideoPipeline::create_swapchain() {
     ComPtr<IDXGIFactory2> factory;
     adapter->GetParent(IID_PPV_ARGS(&factory));
 
-    BOOL allow_tearing = FALSE;
-    ComPtr<IDXGIFactory5> factory5;
-    if (SUCCEEDED(factory.As(&factory5))) {
-        factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
-                                     sizeof(allow_tearing));
+    bool tearing = false;
+    if (main) {
+        BOOL allow_tearing = FALSE;
+        ComPtr<IDXGIFactory5> factory5;
+        if (SUCCEEDED(factory.As(&factory5))) {
+            factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow_tearing,
+                                         sizeof(allow_tearing));
+        }
+        tearing = allow_tearing != FALSE;
     }
-    tearing_ = allow_tearing != FALSE;
 
     DXGI_SWAP_CHAIN_DESC1 desc = {};
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -483,33 +642,39 @@ bool VideoPipeline::create_swapchain() {
     desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     desc.BufferCount = 2;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    desc.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    desc.Flags = tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     desc.Scaling = DXGI_SCALING_STRETCH;
 
-    HRESULT hr = factory->CreateSwapChainForHwnd(device_, hwnd_, &desc, nullptr, nullptr, &swapchain_);
+    HRESULT hr = factory->CreateSwapChainForHwnd(device_, hwnd, &desc, nullptr, nullptr, sc);
     if (FAILED(hr)) {
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-        hr = factory->CreateSwapChainForHwnd(device_, hwnd_, &desc, nullptr, nullptr, &swapchain_);
-        if (FAILED(hr) && tearing_) {
-            tearing_ = false;
+        hr = factory->CreateSwapChainForHwnd(device_, hwnd, &desc, nullptr, nullptr, sc);
+        if (FAILED(hr) && tearing) {
+            tearing = false;
             desc.Flags = 0;
-            hr = factory->CreateSwapChainForHwnd(device_, hwnd_, &desc, nullptr, nullptr, &swapchain_);
+            hr = factory->CreateSwapChainForHwnd(device_, hwnd, &desc, nullptr, nullptr, sc);
         }
         if (FAILED(hr)) {
-            tearing_ = false;
+            tearing = false;
+            if (main) {
+                tearing_ = false;
+            }
             return false;
         }
     }
-    factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+    if (main) {
+        tearing_ = tearing;
+    }
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
 
     ComPtr<IDXGISwapChain2> sc2;
-    if (SUCCEEDED(swapchain_->QueryInterface(IID_PPV_ARGS(&sc2)))) {
+    if (SUCCEEDED((*sc)->QueryInterface(IID_PPV_ARGS(&sc2)))) {
         sc2->SetMaximumFrameLatency(1);
     }
 
     ID3D11Texture2D *back = nullptr;
-    swapchain_->GetBuffer(0, IID_PPV_ARGS(&back));
-    device_->CreateRenderTargetView(back, nullptr, &rtv_);
+    (*sc)->GetBuffer(0, IID_PPV_ARGS(&back));
+    device_->CreateRenderTargetView(back, nullptr, rtv);
     back->Release();
     return true;
 }
@@ -992,25 +1157,27 @@ void VideoPipeline::render_loop() {
     DWORD mmcss_idx = 0;
     HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Games", &mmcss_idx);
     while (render_run_) {
-        bool animating;
+        bool animating, pending;
         {
             std::lock_guard<std::mutex> lock(mu_);
-            animating = has_frame_.load() && studio_.animating((double) now_us() / 1e6);
+            animating = live() && studio_.animating((double) now_us() / 1e6);
+            pending = preview_pending_ && preview_sc_;
         }
         {
-            // A fade or a drifting title card runs on a steady ~60 fps tick (new video just rides along);
-            // otherwise new video wakes us at once, and with nothing new we sleep.
+            // A fade or a drifting title card runs on a steady ~60 fps tick (new video just rides along); a
+            // preview frame held back by its cap comes a little later; otherwise new video wakes us at once,
+            // and with nothing new we sleep.
             std::unique_lock<std::mutex> lock(render_mu_);
             if (animating) {
                 render_cv_.wait_for(lock, std::chrono::milliseconds(16), [this] { return !render_run_.load(); });
             } else {
-                render_cv_.wait_for(lock, std::chrono::milliseconds(250),
+                render_cv_.wait_for(lock, std::chrono::milliseconds(pending ? 34 : 250),
                                     [this] { return render_dirty_ || !render_run_; });
             }
             if (!render_run_) {
                 break;
             }
-            if (!render_dirty_ && !animating) {
+            if (!render_dirty_ && !animating && !pending) {
                 continue;
             }
             render_dirty_ = false;
@@ -1024,14 +1191,9 @@ void VideoPipeline::render_loop() {
 }
 
 void VideoPipeline::render_once() {
-    if (!rtv_ || !swapchain_ || !has_frame_.load() || !nv12_) {
-        return;
-    }
-    RECT rc = {};
-    GetClientRect(hwnd_, &rc);
-    int cw = rc.right - rc.left;
-    int ch = rc.bottom - rc.top;
-    if (cw <= 0 || ch <= 0) {
+    bool is_live = live();
+    bool previewing = preview_sc_ && preview_rtv_ && preview_hwnd_;
+    if (!is_live && !previewing) {
         return;
     }
     UINT stride = sizeof(Vertex), offset = 0;
@@ -1046,9 +1208,10 @@ void VideoPipeline::render_once() {
         ctx_->OMSetBlendState(nullptr, factor, 0xffffffff);
     };
 
-    // 1. A new picture: NV12 -> RGB at the stream's own resolution, then mips (for the blurred backdrop and
-    //    for scaling down without shimmer).
-    if (src_dirty_ && tex_w_ > 0 && tex_h_ > 0 && unit_cbuf_ && ensure_rgba(tex_w_, tex_h_)) {
+    // 1. A new iPad picture: NV12 -> RGB at the stream's own resolution, then mips (for the blurred backdrop
+    //    and for scaling down without shimmer).
+    if (has_frame_.load() && src_dirty_ && nv12_ && tex_w_ > 0 && tex_h_ > 0 && unit_cbuf_ &&
+        ensure_rgba(tex_w_, tex_h_)) {
         if (color_cbuf_ && color_cbuf_dirty_) {
             D3D11_MAPPED_SUBRESOURCE map = {};
             if (SUCCEEDED(ctx_->Map(color_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
@@ -1079,38 +1242,104 @@ void VideoPipeline::render_once() {
         ctx_->GenerateMips(rgba_srv_);
         src_dirty_ = false;
     }
+    // 1b. A new computer picture only needs its mips.
+    if (comp_dirty_ && comp_srv_) {
+        ctx_->GenerateMips(comp_srv_);
+        comp_dirty_ = false;
+    }
+    Studio::Sources src;
+    if (has_frame_.load() && rgba_srv_) {
+        src.ipad = {rgba_srv_, rgba_w_, rgba_h_, rgba_mips_};
+    }
+    if (comp_live_.load() && comp_srv_) {
+        src.computer = {comp_srv_, comp_w_, comp_h_, comp_mips_};
+    }
+    double now = (double) now_us() / 1e6;
 
-    // 2. The scene, on the 16:9 canvas.
-    studio_.render(rgba_ ? rgba_srv_ : nullptr, rgba_w_, rgba_h_, rgba_mips_, (double) now_us() / 1e6);
-
-    // 3. Recording gets the canvas exactly as composed: no window, no controls.
-    if (recorder_ && recorder_->active()) {
-        ID3D11Texture2D *y = nullptr, *uv = nullptr;
-        if (studio_.export_planes(&y, &uv)) {
-            recorder_->on_canvas(device_, ctx_, y, uv, studio_.canvas_w(), studio_.canvas_h(), now_us());
+    // 2. The live scene, on the 16:9 canvas.
+    if (is_live || (previewing && preview_mode_ == PreviewLive)) {
+        studio_.render(src, now);
+        // 3. Recording gets the canvas exactly as composed: no window, no controls.
+        if (is_live && recorder_ && recorder_->active()) {
+            ID3D11Texture2D *y = nullptr, *uv = nullptr;
+            if (studio_.export_planes(&y, &uv)) {
+                recorder_->on_canvas(device_, ctx_, y, uv, studio_.canvas_w(), studio_.canvas_h(), now_us());
+            }
+        }
+        // 4. The window: the canvas fitted (or, full screen with Fill, cropped) to it.
+        if (is_live && rtv_ && swapchain_) {
+            present(swapchain_, rtv_, hwnd_, studio_.canvas_srv(), studio_.canvas_w(), studio_.canvas_h(),
+                    studio_.canvas_mips(), true, cover_.load(), true);
         }
     }
 
-    // 4. The window: the canvas fitted (or, full screen with Fill, cropped) to it, bicubic from the right mip.
-    int vw = studio_.canvas_w(), vh = studio_.canvas_h();
-    if (vw <= 0 || vh <= 0 || !ps_scale_ || !scale_cbuf_ || !cbuf_) {
+    // 5. The preview: an edited scene, the live canvas, or one screen as it arrives. Capped near 30 fps so
+    //    a preview left open while teaching costs little.
+    if (previewing) {
+        int64_t t = now_us();
+        if (!preview_dirty_ && t - preview_last_us_ < 33000) {
+            preview_pending_ = true;
+            return;
+        }
+        preview_dirty_ = false;
+        preview_pending_ = false;
+        preview_last_us_ = t;
+        if (preview_mode_ == PreviewLive) {
+            present(preview_sc_, preview_rtv_, preview_hwnd_, studio_.canvas_srv(), studio_.canvas_w(),
+                    studio_.canvas_h(), studio_.canvas_mips(), false, false, false);
+        } else if (preview_mode_ == PreviewSource) {
+            const Studio::Source &s = src.get(preview_source_);
+            present(preview_sc_, preview_rtv_, preview_hwnd_, s.srv, s.w, s.h, s.mips, false, false, false);
+        } else {
+            studio_.render_preview(preview_scene_, src, preview_marks_, now);
+            present(preview_sc_, preview_rtv_, preview_hwnd_, studio_.preview_srv(), studio_.preview_w(),
+                    studio_.preview_h(), studio_.preview_mips(), true, false, false);
+        }
+    }
+}
+
+void VideoPipeline::present(IDXGISwapChain1 *sc, ID3D11RenderTargetView *rtv, HWND hwnd, ID3D11ShaderResourceView *srv,
+                            int vw, int vh, int mips, bool gen_mips, bool cover, bool main) {
+    RECT rc = {};
+    GetClientRect(hwnd, &rc);
+    int cw = rc.right - rc.left;
+    int ch = rc.bottom - rc.top;
+    if (cw <= 0 || ch <= 0 || !ps_scale_ || !scale_cbuf_ || !cbuf_) {
         return;
     }
-    float sx = 1, sy = 1;
-    float va = (float) vw / (float) vh;
-    float wa = (float) cw / (float) ch;
-    if (cover_.load()) {
-        if (wa > va) {
-            sy = wa / va;
-        } else {
+    UINT stride = sizeof(Vertex), offset = 0;
+    ctx_->IASetInputLayout(layout_);
+    ctx_->IASetVertexBuffers(0, 1, &vb_, &stride, &offset);
+    ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ctx_->VSSetShader(vs_, nullptr, 0);
+    ctx_->PSSetSamplers(0, 1, &sampler_);
+    ctx_->RSSetState(raster_);
+    float factor[4] = {};
+    ctx_->OMSetBlendState(nullptr, factor, 0xffffffff);
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float) cw;
+    vp.Height = (float) ch;
+    vp.MaxDepth = 1;
+    ctx_->RSSetViewports(1, &vp);
+    ctx_->OMSetRenderTargets(1, &rtv, nullptr);
+    float bars[4] = {0.03f, 0.035f, 0.05f, 1};
+    float empty[4] = {0.09f, 0.10f, 0.12f, 1};
+    ctx_->ClearRenderTargetView(rtv, main ? bars : empty);
+    if (srv && vw > 0 && vh > 0) {
+        float sx = 1, sy = 1;
+        float va = (float) vw / (float) vh;
+        float wa = (float) cw / (float) ch;
+        if (cover) {
+            if (wa > va) {
+                sy = wa / va;
+            } else {
+                sx = va / wa;
+            }
+        } else if (wa > va) {
             sx = va / wa;
+        } else {
+            sy = wa / va;
         }
-    } else if (wa > va) {
-        sx = va / wa;
-    } else {
-        sy = wa / va;
-    }
-    if (cw != present_cw_ || ch != present_ch_ || sx != letter_x_ || sy != letter_y_) {
         D3D11_MAPPED_SUBRESOURCE map = {};
         if (SUCCEEDED(ctx_->Map(cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
             float *f = (float *) map.pData;
@@ -1119,55 +1348,44 @@ void VideoPipeline::render_once() {
             f[2] = f[3] = 0;
             ctx_->Unmap(cbuf_, 0);
         }
-        present_cw_ = cw;
-        present_ch_ = ch;
-        letter_x_ = sx;
-        letter_y_ = sy;
+        float scale = (std::min)((float) cw * sx / (float) vw, (float) ch * sy / (float) vh);
+        int lod = 0;
+        if (scale < 1.0f) {
+            lod = (std::min)((int) std::floor(std::log2(1.0f / scale)), mips - 1);
+        }
+        if (lod > 0 && gen_mips) {
+            ctx_->GenerateMips(srv);
+        }
+        if (SUCCEEDED(ctx_->Map(scale_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+            float *f = (float *) map.pData;
+            f[0] = (float) (std::max)(1, vw >> lod);
+            f[1] = (float) (std::max)(1, vh >> lod);
+            f[2] = (float) lod;
+            f[3] = 0;
+            ctx_->Unmap(scale_cbuf_, 0);
+        }
+        ctx_->VSSetConstantBuffers(0, 1, &cbuf_);
+        ctx_->PSSetShader(ps_scale_, nullptr, 0);
+        ctx_->PSSetConstantBuffers(2, 1, &scale_cbuf_);
+        ctx_->PSSetShaderResources(0, 1, &srv);
+        ctx_->Draw(4, 0);
+        ID3D11ShaderResourceView *none = nullptr;
+        ctx_->PSSetShaderResources(0, 1, &none);
     }
-    float scale = (std::min)((float) cw * sx / (float) vw, (float) ch * sy / (float) vh);
-    int lod = 0;
-    if (scale < 1.0f) {
-        lod = (std::min)((int) std::floor(std::log2(1.0f / scale)), studio_.canvas_mips() - 1);
-    }
-    if (lod > 0) {
-        ctx_->GenerateMips(studio_.canvas_srv());
-    }
-    D3D11_MAPPED_SUBRESOURCE map = {};
-    if (SUCCEEDED(ctx_->Map(scale_cbuf_, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
-        float *f = (float *) map.pData;
-        f[0] = (float) (std::max)(1, vw >> lod);
-        f[1] = (float) (std::max)(1, vh >> lod);
-        f[2] = (float) lod;
-        f[3] = 0;
-        ctx_->Unmap(scale_cbuf_, 0);
-    }
-    bind_quad();
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (float) cw;
-    vp.Height = (float) ch;
-    vp.MaxDepth = 1;
-    ctx_->RSSetViewports(1, &vp);
-    ctx_->OMSetRenderTargets(1, &rtv_, nullptr);
-    float bars[4] = {0.03f, 0.035f, 0.05f, 1};
-    ctx_->ClearRenderTargetView(rtv_, bars);
-    ctx_->VSSetConstantBuffers(0, 1, &cbuf_);
-    ctx_->PSSetShader(ps_scale_, nullptr, 0);
-    ctx_->PSSetConstantBuffers(2, 1, &scale_cbuf_);
-    ID3D11ShaderResourceView *canvas = studio_.canvas_srv();
-    ctx_->PSSetShaderResources(0, 1, &canvas);
-    ctx_->Draw(4, 0);
-    ID3D11ShaderResourceView *none = nullptr;
-    ctx_->PSSetShaderResources(0, 1, &none);
+    ID3D11RenderTargetView *no_rtv = nullptr;
+    ctx_->OMSetRenderTargets(1, &no_rtv, nullptr);
 
     // Smooth mode lines frames up with the display's refresh; otherwise show them the instant they're ready.
     HRESULT hr;
-    if (smooth_.load()) {
-        hr = swapchain_->Present(1, 0);
+    if (!main) {
+        hr = sc->Present(0, 0);
+    } else if (smooth_.load()) {
+        hr = sc->Present(1, 0);
     } else {
-        hr = swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+        hr = sc->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
         if (hr == DXGI_ERROR_INVALID_CALL && tearing_) {
             tearing_ = false;
-            hr = swapchain_->Present(0, 0);
+            hr = sc->Present(0, 0);
         }
     }
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {

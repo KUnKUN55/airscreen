@@ -206,6 +206,11 @@ bool Recorder::start(const std::wstring &path) {
     last_video_us_ = 0; // offset_us_ carries over: note_clock() keeps it current whenever video flows
     base_local_us_ = 0;
     end_local_us_ = 0;
+    {
+        std::lock_guard<std::mutex> lock(pause_mu_);
+        pause_start_ = 0;
+        paused_total_ = 0;
+    }
     dropped_ = 0;
     run_ = true;
     active_ = true;
@@ -224,7 +229,7 @@ void Recorder::stop() {
         return;
     }
     if (base_local_us_.load() && !end_local_us_.load()) {
-        end_local_us_ = local_us();
+        end_local_us_ = clip_us();
     }
     {
         std::lock_guard<std::mutex> lock(q_mu_);
@@ -249,7 +254,41 @@ double Recorder::seconds() const {
         return 0;
     }
     int64_t end = end_local_us_.load();
-    return (double) ((end ? end : local_us()) - start) / 1e6;
+    return (double) ((end ? end : clip_us()) - start) / 1e6;
+}
+
+void Recorder::set_paused(bool paused) {
+    std::lock_guard<std::mutex> lock(pause_mu_);
+    if (paused == (pause_start_ != 0) || (paused && !active_.load())) {
+        return;
+    }
+    if (paused) {
+        pause_start_ = local_us();
+        rlog("paused");
+    } else {
+        paused_total_ += local_us() - pause_start_;
+        pause_start_ = 0;
+        rlog("resumed");
+    }
+}
+
+bool Recorder::paused() const {
+    std::lock_guard<std::mutex> lock(pause_mu_);
+    return pause_start_ != 0;
+}
+
+int64_t Recorder::clip_us() const {
+    std::lock_guard<std::mutex> lock(pause_mu_);
+    return (pause_start_ ? pause_start_ : local_us()) - paused_total_;
+}
+
+bool Recorder::to_clip(int64_t local, int64_t *clip) const {
+    std::lock_guard<std::mutex> lock(pause_mu_);
+    if (pause_start_) {
+        return false;
+    }
+    *clip = local - paused_total_;
+    return true;
 }
 
 std::wstring Recorder::path() const {
@@ -360,7 +399,8 @@ void Recorder::release_item(Item &it) {
 
 void Recorder::on_canvas(ID3D11Device *device, ID3D11DeviceContext *ctx, ID3D11Texture2D *y, ID3D11Texture2D *uv,
                          int w, int h, int64_t local_time_us) {
-    if (!active_.load() || !y || !uv || w <= 0 || h <= 0 || !video_slot_free()) {
+    if (!active_.load() || !y || !uv || w <= 0 || h <= 0 || !to_clip(local_time_us, &local_time_us) ||
+        !video_slot_free()) {
         return;
     }
     Item it;
@@ -427,6 +467,9 @@ void Recorder::on_audio_pcm(const int16_t *pcm, int frames, int channels, int ra
     it.video = false;
     int64_t off = offset_us_.load();
     it.pts_us = ntp_ns && off != INT64_MIN ? (int64_t) (ntp_ns / 1000) + off : INT64_MIN; // onto the local clock
+    if (it.pts_us == INT64_MIN ? paused() : !to_clip(it.pts_us, &it.pts_us)) {
+        return;
+    }
     it.channels = channels;
     it.rate = rate;
     it.pcm.assign(pcm, pcm + (size_t) frames * (size_t) channels);
@@ -447,7 +490,9 @@ void Recorder::on_mic_pcm(const float *pcm, int frames, int64_t local_time_us) {
     float gain = mic_gain_.load();
     Item it;
     it.mic = true;
-    it.pts_us = local_time_us; // the clip's timeline is the local clock already
+    if (!to_clip(local_time_us, &it.pts_us)) {
+        return; // paused
+    }
     it.fpcm.resize((size_t) frames * MicCapture::kChannels);
     for (size_t i = 0; i < it.fpcm.size(); ++i) {
         it.fpcm[i] = pcm[i] * gain;
@@ -629,7 +674,7 @@ bool Recorder::handle_video(Item &it) {
 // file keeps growing (and stays crash-safe) under a narration, and editors don't see a frozen gap.
 bool Recorder::repeat_if_still() {
     Out &o = *out_;
-    int64_t now = local_us();
+    int64_t now = clip_us(); // stands still while paused, so nothing repeats into the pause
     if (!o.last_frame || now - o.last_video_local < kRepeatUs) {
         return true;
     }
@@ -647,7 +692,7 @@ bool Recorder::encode_last_frame(int64_t pts_us) {
         pts = o.last_vpts + 1;
     }
     o.last_vpts = pts;
-    o.last_video_local = local_us();
+    o.last_video_local = clip_us();
     AVFrame *f = av_frame_clone(o.last_frame);
     if (!f) {
         return true;
@@ -674,7 +719,7 @@ void Recorder::mix_in(int src, const float *pcm, int frames, int64_t at, bool ti
         at = next;
     }
     next = at + frames;
-    o.src_last_local[src] = local_us();
+    o.src_last_local[src] = clip_us();
     if (at < o.mix_pos) {
         int64_t skip = o.mix_pos - at;
         if (skip >= frames) {
@@ -707,7 +752,7 @@ int64_t Recorder::watermark() const {
         return 0;
     }
     const Out &o = *out_;
-    int64_t now = local_us();
+    int64_t now = clip_us();
     int64_t wm = (now - o.part_base_us - kMixLatencyUs) * kAudioRate / 1000000;
     for (int s = 0; s < 2; ++s) {
         if (o.src_last_local[s] && now - o.src_last_local[s] < kSourceIdleUs && o.src_next[s] != INT64_MIN) {

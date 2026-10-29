@@ -54,6 +54,19 @@ The installer isn't code-signed yet, so Windows SmartScreen may show "Windows pr
 
 To stop, end mirroring on the iPhone. Close the window to quit AirScreen. Right-click the window or the tray icon for settings.
 
+## Teaching studio
+
+For online classes and tutoring, AirScreen can compose what students see from the iPad, this PC's screen, text and logos, and switch between layouts while you teach. Share the AirScreen window in Zoom, Teams or Meet (or record it), and control it from a small panel that stays out of the way.
+
+- **Teaching controls** (Ctrl+T, or right-click → Teaching controls): what's on air, the scenes, quick buttons (iPad / Computer / Both / Text by default) and recording with pause. Closing the panel never stops sharing or recording. It can stay on top, shrink to a compact view, and is kept out of screen captures, so sharing a whole display doesn't show your controls.
+- **Computer screen**: press **Computer…** to share a whole display or a single app window. A preview is shown first, and you're warned when you pick a whole display. Windows outlines whatever is being captured. If the window closes, AirScreen says so and carries on.
+- **Scenes**: six samples to start from (iPad Teaching, Computer Presentation, Dual Screen, Title & Teaching, Minimal, Break). **Edit scenes** opens the editor: add iPad or computer screens, text, pictures and frames; drag and resize them on the live preview with snapping guides; set opacity, order and lock per layer. Text supports Thai and English, wraps and shrinks to fit, with a background that can be solid, outline, translucent, frosted (blurs only what's behind the box), or a gradient.
+- **Preview**: see a scene before putting it on air, the output itself, or one screen as it arrives. Edits to the scene on air show at once, or wait for **Apply** if you prefer.
+- **Profiles**: keep a set of scenes and saved text per subject (Teaching settings → Profiles). Everything is saved automatically to `%APPDATA%\AirScreen\profiles`.
+- **Shortcuts**: Ctrl+Alt with a digit or letter (scenes, iPad, Computer, Both, text, panel, record). They work in AirScreen's windows, and in every app if you turn that on in Teaching settings. Start with `--teach` to open the controls straight away.
+
+Recording uses the same composed picture students see, so scene changes go into one continuous file, and pauses leave no gap.
+
 ## Troubleshooting
 
 **AirScreen doesn't appear on the iPhone**
@@ -91,6 +104,9 @@ To build an installer, run [Inno Setup](https://jrsoftware.org/isinfo.php)'s `is
 | `src/video.cpp` | FFmpeg decoding and Direct3D 11 presentation |
 | `src/audio.cpp` | AAC/ALAC decoding and WASAPI playback |
 | `src/main.cpp`, `src/ui.cpp` | Window, tray menu and idle screen |
+| `src/scene.cpp`, `src/studio.cpp` | Teaching scenes and profiles; the GPU compositor that draws them |
+| `src/capture.cpp` | Computer screen capture (Windows.Graphics.Capture) |
+| `src/control.cpp`, `src/editor.cpp`, `src/dialogs.cpp` | Teaching control panel, scene editor and preview, settings |
 | `src/settings.cpp` | Settings file, firewall rule, log |
 | `third_party/uxplay` | AirPlay protocol stack (RAOP, mirroring, mDNS) |
 | `third_party/libplist` | Property list parsing |

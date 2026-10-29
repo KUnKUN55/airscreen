@@ -23,14 +23,32 @@ struct Settings {
     int mic_gain_pct = 100;
     // Studio: the 16:9 canvas the window shows and clips record.
     int canvas_h = 1440;  // 1080, 1440 or 2160
-    bool framed = true;   // Screen scene: rounded picture with a shadow, rather than full size on black
-    int background = 0;   // 0 studio colours, 1 blurred screen, 2 your picture
-    std::string background_image; // copy of the chosen picture in %APPDATA%\AirScreen (UTF-8 path)
+    // The fixed scenes of earlier versions. Only read, to seed the first teaching profile with what was typed.
+    bool framed = true;
+    int background = 0;
+    std::string background_image;
     std::string scene_text[6] = {"เริ่มในอีกสักครู่", "", "พักสักครู่", "เดี๋ยวกลับมาต่อ", "ขอบคุณที่รับชม", ""};
-    // (title, subtitle) for Intro, Break and Outro, UTF-8
-    bool screen_caption = false; // a lower-third caption on the Screen scene
-    std::string screen_text[2] = {"", ""}; // its (title, subtitle), UTF-8
+    bool screen_caption = false;
+    std::string screen_text[2] = {"", ""};
     int win_x = 0, win_y = 0, win_w = 0, win_h = 0; // 0 size = default placement
+
+    // Teaching studio
+    std::string profile = "General Presentation"; // scenes in use (UTF-8 profile name)
+    int panel_auto = 1;        // open the control panel by itself: 1 when sharing starts, 2 when recording starts
+    bool teach_mode = false;   // open the control panel when AirScreen starts
+    bool panel_topmost = true; // keep the control panel above other windows
+    bool panel_compact = false;
+    int panel_x = 0, panel_y = 0, panel_w = 0, panel_h = 0;
+    int editor_x = 0, editor_y = 0, editor_w = 0, editor_h = 0;
+    bool hide_controls = true; // keep AirScreen's control windows out of screen captures
+    int apply_mode = 0;        // editing the scene on air: 0 shows changes at once, 1 waits for Apply
+    int transition = 0;        // switching scenes: 0 cross-fade, 1 cut
+    bool capture_cursor = true;
+    int capture_fps = 30;          // computer screen frame cap: 30 or 60
+    std::string last_source;       // "display:2" or "window:<title>": offered first next time
+    std::string quick = "ipad,computer,both,text"; // control panel quick buttons, by action name
+    bool hotkeys = false;          // shortcuts that work while other apps are in front
+    std::string hotkey_map;        // "action:mods:vk,..."; empty = the defaults
 };
 
 std::wstring app_data_dir();

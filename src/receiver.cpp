@@ -450,7 +450,8 @@ void Receiver::teardown_session() {
     bool was = connected_.exchange(false);
     bool had_frame = video_.has_frame();
     on_log(LOGGER_INFO, "session teardown");
-    if (recorder_.active()) {
+    // A clip of the computer screen carries on without the iPad; with nothing left to show, it ends here.
+    if (recorder_.active() && !video_.computer_live()) {
         recorder_.stop();
         if (ui_) {
             ui_(UiEvent::RecordingStopped, recorder_.last_error());

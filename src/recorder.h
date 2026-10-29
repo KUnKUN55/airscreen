@@ -38,6 +38,10 @@ public:
     bool start(const std::wstring &path);
     void stop();
     bool active() const { return active_.load(); }
+    // Paused: nothing reaches the file and the clip's clock stands still, so resuming carries straight on
+    // with no gap (and the audio stays in step with the picture).
+    void set_paused(bool paused);
+    bool paused() const;
     double seconds() const;
     std::wstring path() const;
     std::string last_error() const;
@@ -95,6 +99,10 @@ private:
     void return_staging(Item &it);
     void set_error(const std::string &msg);
     std::wstring part_path(int part) const;
+    // The clip's clock: local time less every pause so far, frozen while paused.
+    int64_t clip_us() const;
+    // `local` moved onto the clip's clock; false while paused (the item is dropped).
+    bool to_clip(int64_t local, int64_t *clip) const;
 
     std::mutex life_mu_; // start/stop come from the UI and from session teardown
     std::atomic<bool> active_{false};
@@ -110,8 +118,11 @@ private:
     // Shared between the render thread (producer) and the writer: the clip's zero point, local clock.
     std::atomic<int64_t> base_us_{INT64_MIN};
     std::atomic<int64_t> last_video_us_{0};
-    std::atomic<int64_t> base_local_us_{0}; // local time of the clip's first picture; 0 = none yet
-    std::atomic<int64_t> end_local_us_{0};  // local time the clip was stopped
+    std::atomic<int64_t> base_local_us_{0}; // clip time of the clip's first picture; 0 = none yet
+    std::atomic<int64_t> end_local_us_{0};  // clip time the clip was stopped
+    mutable std::mutex pause_mu_;
+    int64_t pause_start_ = 0;  // local time the current pause began, 0 while recording; guarded by pause_mu_
+    int64_t paused_total_ = 0; // guarded by pause_mu_
     std::atomic<int64_t> offset_us_{INT64_MIN}; // local clock minus sender clock, from the video frames
     int64_t win_start_ = 0;                     // windowed minimum behind offset_us_; decode thread only
     int64_t cur_min_ = 0;

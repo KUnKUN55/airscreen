@@ -16,24 +16,124 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 196, 62, 52, 16
 END
 
-IDD_SCENES DIALOGEX 0, 0, 300, 266
+IDD_PROMPT DIALOGEX 0, 0, 260, 84
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
-CAPTION "Scene text"
+CAPTION "AirScreen"
 FONT 10, "Segoe UI"
 BEGIN
-    LTEXT           "Title and a smaller line for each scene. Leave a line empty to hide it.", -1, 12, 10, 276, 12
-    LTEXT           "1  Intro", -1, 12, 30, 276, 10
-    EDITTEXT        IDC_SCENE_TEXT0, 12, 42, 276, 14, ES_AUTOHSCROLL
-    EDITTEXT        1011, 12, 59, 276, 14, ES_AUTOHSCROLL
-    AUTOCHECKBOX    "2  Screen: show a caption in the bottom-left corner", IDC_SCREEN_CAPTION, 12, 82, 276, 12
-    EDITTEXT        IDC_SCREEN_TEXT0, 12, 96, 276, 14, ES_AUTOHSCROLL
-    EDITTEXT        1017, 12, 113, 276, 14, ES_AUTOHSCROLL
-    LTEXT           "3  Break", -1, 12, 136, 276, 10
-    EDITTEXT        1012, 12, 148, 276, 14, ES_AUTOHSCROLL
-    EDITTEXT        1013, 12, 165, 276, 14, ES_AUTOHSCROLL
-    LTEXT           "4  Outro", -1, 12, 188, 276, 10
-    EDITTEXT        1014, 12, 200, 276, 14, ES_AUTOHSCROLL
-    EDITTEXT        1015, 12, 217, 276, 14, ES_AUTOHSCROLL
-    DEFPUSHBUTTON   "Save", IDOK, 180, 242, 52, 16
-    PUSHBUTTON      "Cancel", IDCANCEL, 236, 242, 52, 16
+    LTEXT           "", IDC_PROMPT_LABEL, 12, 10, 236, 18
+    EDITTEXT        IDC_PROMPT_EDIT, 12, 30, 236, 16, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "OK", IDOK, 140, 60, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 196, 60, 52, 16
+END
+
+IDD_PICKER DIALOGEX 0, 0, 440, 248
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Share the computer screen"
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT           "Choose what students see. Only what you pick is captured, and Windows outlines it while it is shared.", -1, 12, 8, 416, 18
+    LISTBOX         IDC_PICK_LIST, 12, 30, 196, 182, NOT LBS_SORT | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | LBS_NOINTEGRALHEIGHT
+    LTEXT           "", IDC_PICK_PREVIEW, 218, 30, 210, 118, SS_BLACKFRAME
+    LTEXT           "", IDC_PICK_WARN, 218, 154, 210, 42
+    AUTOCHECKBOX    "Show the mouse pointer", IDC_PICK_CURSOR, 218, 200, 150, 12
+    PUSHBUTTON      "Refresh list", IDC_PICK_REFRESH, 12, 222, 70, 16
+    DEFPUSHBUTTON   "Share", IDOK, 320, 222, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 376, 222, 52, 16
+END
+
+IDD_LIVETEXT DIALOGEX 0, 0, 300, 196
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Text on air"
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT           "Text", -1, 12, 12, 40, 10
+    COMBOBOX        IDC_LT_LAYER, 56, 10, 232, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    EDITTEXT        IDC_LT_TEXT, 12, 30, 276, 70, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL
+    LTEXT           "Saved", -1, 12, 110, 40, 10
+    COMBOBOX        IDC_LT_SNIP, 56, 108, 180, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Use", IDC_LT_USE, 240, 107, 48, 15
+    AUTOCHECKBOX    "Show this text", IDC_LT_SHOW, 12, 132, 200, 12
+    AUTOCHECKBOX    "Also keep it in the scene for next time", IDC_LT_KEEP, 12, 148, 260, 12
+    DEFPUSHBUTTON   "Show on air", IDOK, 180, 172, 56, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 240, 172, 48, 16
+END
+
+IDD_PREFS DIALOGEX 0, 0, 340, 270
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Teaching settings"
+FONT 10, "Segoe UI"
+BEGIN
+    CONTROL         "", IDC_PREF_TABS, "SysTabControl32", WS_TABSTOP, 8, 8, 324, 232
+    DEFPUSHBUTTON   "OK", IDOK, 224, 248, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 280, 248, 52, 16
+END
+
+IDD_PREF_PANEL DIALOGEX 0, 0, 312, 206
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT           "Open the control panel by itself", -1, 8, 6, 290, 10
+    AUTOCHECKBOX    "When sharing starts (iPad or computer)", IDC_PP_SHARE, 16, 18, 280, 12
+    AUTOCHECKBOX    "When recording starts", IDC_PP_RECORD, 16, 32, 280, 12
+    AUTOCHECKBOX    "When AirScreen starts (teaching mode)", IDC_PP_STARTUP, 16, 46, 280, 12
+    AUTOCHECKBOX    "Keep the control panel above other windows", IDC_PP_TOP, 8, 64, 290, 12
+    AUTOCHECKBOX    "Compact control panel", IDC_PP_COMPACT, 8, 78, 290, 12
+    AUTOCHECKBOX    "Keep AirScreen's control windows out of screen sharing", IDC_PP_HIDE, 8, 92, 296, 12
+    LTEXT           "Switching scenes", -1, 8, 114, 100, 10
+    COMBOBOX        IDC_PP_TRANSITION, 120, 112, 180, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "Editing the scene on air", -1, 8, 132, 110, 10
+    COMBOBOX        IDC_PP_APPLY, 120, 130, 180, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "Computer screen", -1, 8, 150, 100, 10
+    COMBOBOX        IDC_PP_FPS, 120, 148, 180, 80, CBS_DROPDOWNLIST | WS_TABSTOP
+    AUTOCHECKBOX    "Show the mouse pointer on the computer screen", IDC_PP_CURSOR, 8, 168, 296, 12
+END
+
+IDD_PREF_QUICK DIALOGEX 0, 0, 312, 206
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT           "The quick buttons on the control panel, in order (four to a row; compact view shows the first four).", -1, 8, 6, 296, 18
+    LTEXT           "1", -1, 8, 30, 10, 10
+    COMBOBOX        IDC_PQ_SLOT0, 20, 28, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "2", -1, 160, 30, 10, 10
+    COMBOBOX        1151, 172, 28, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "3", -1, 8, 50, 10, 10
+    COMBOBOX        1152, 20, 48, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "4", -1, 160, 50, 10, 10
+    COMBOBOX        1153, 172, 48, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "5", -1, 8, 70, 10, 10
+    COMBOBOX        1154, 20, 68, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "6", -1, 160, 70, 10, 10
+    COMBOBOX        1155, 172, 68, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "7", -1, 8, 90, 10, 10
+    COMBOBOX        1156, 20, 88, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "8", -1, 160, 90, 10, 10
+    COMBOBOX        1157, 172, 88, 130, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+END
+
+IDD_PREF_KEYS DIALOGEX 0, 0, 312, 206
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 10, "Segoe UI"
+BEGIN
+    AUTOCHECKBOX    "Use these shortcuts in any app (off: only in AirScreen's own windows)", IDC_PK_ENABLE, 8, 4, 296, 12
+    CONTROL         "", IDC_PK_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 8, 20, 296, 118
+    CONTROL         "", IDC_PK_HOTKEY, "msctls_hotkey32", WS_BORDER | WS_TABSTOP, 8, 144, 120, 14
+    PUSHBUTTON      "Set", IDC_PK_SET, 134, 143, 44, 15
+    PUSHBUTTON      "Clear", IDC_PK_CLEAR, 182, 143, 44, 15
+    PUSHBUTTON      "Defaults", IDC_PK_RESET, 252, 143, 52, 15
+    LTEXT           "", IDC_PK_NOTE, 8, 164, 296, 40
+END
+
+IDD_PREF_PROFILES DIALOGEX 0, 0, 312, 206
+STYLE DS_SETFONT | DS_CONTROL | WS_CHILD
+FONT 10, "Segoe UI"
+BEGIN
+    LTEXT           "Each profile keeps its own scenes and saved text, e.g. one per subject. Changes here apply at once.", -1, 8, 4, 296, 18
+    LISTBOX         IDC_PF_LIST, 8, 26, 200, 170, NOT LBS_SORT | LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | LBS_NOINTEGRALHEIGHT
+    PUSHBUTTON      "Use", IDC_PF_USE, 216, 26, 88, 16
+    PUSHBUTTON      "New", IDC_PF_NEW, 216, 48, 88, 16
+    PUSHBUTTON      "Duplicate", IDC_PF_DUP, 216, 68, 88, 16
+    PUSHBUTTON      "Rename", IDC_PF_RENAME, 216, 88, 88, 16
+    PUSHBUTTON      "Delete", IDC_PF_DELETE, 216, 108, 88, 16
 END
