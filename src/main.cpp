@@ -48,6 +48,7 @@ constexpr UINT kOverlayHideMs = 2200;
 constexpr UINT kDisconnectMs = 400;
 constexpr UINT kSaveMs = 800; // edits are saved this long after the last one
 constexpr int kMaxBarScenes = 8;
+constexpr int kSceneGear = -2; // scene bar hit: the settings button at its right end
 UINT g_taskbar_created = 0;
 
 struct NameDlgState {
@@ -59,7 +60,6 @@ struct NameDlgState {
 struct App : airscreen::TeachHost {
     HWND hwnd = nullptr;
     HWND video_hwnd = nullptr;
-    HWND settings_hwnd = nullptr;
     HINSTANCE inst = nullptr;
     NOTIFYICONDATAW nid = {};
     airscreen::Settings settings_;
@@ -67,7 +67,6 @@ struct App : airscreen::TeachHost {
     airscreen::ShellUi shell;
     bool fullscreen = false;
     bool running = true;
-    bool settings_hot = false;
     bool mirroring = false; // the iPad's picture is showing
     bool start_failed = false;
     int hover = 0;
@@ -79,7 +78,7 @@ struct App : airscreen::TeachHost {
     std::wstring overlay_detail;
     bool connected = false;
     bool recording = false;
-    int scene_hot = -1; // scene bar segment under the mouse
+    int scene_hot = -1; // scene bar segment under the mouse (kSceneGear for the settings button)
     HWND scenes_hwnd = nullptr;
     std::vector<airscreen::MicCapture::Device> mics; // as listed when the menu last opened
     HICON icon = nullptr;
@@ -347,22 +346,11 @@ void layout_chrome(App *app) {
                      SWP_NOACTIVATE);
     }
     UINT dpi = window_dpi(app->hwnd);
-    int size = MulDiv(40, dpi, 96);
     int margin = MulDiv(12, dpi, 96);
-    int x = cw - margin - size;
-    int y = margin;
-    if (x < margin) {
-        x = margin;
-    }
-    if (app->settings_hwnd) {
-        SetWindowPos(app->settings_hwnd, HWND_TOP, x, y, size, size, SWP_NOACTIVATE);
-        HRGN rgn = CreateRoundRectRgn(0, 0, size + 1, size + 1, size, size);
-        SetWindowRgn(app->settings_hwnd, rgn, TRUE);
-    }
     if (app->scenes_hwnd) {
-        // Scene bar: bottom centre, a pill with a segment per scene (the first eight).
+        // Scene bar: bottom centre, a pill with a segment per scene (the first eight), then the settings gear.
         int n = (std::max)(1, bar_scenes(app));
-        int bw = (std::min)(MulDiv(n * 128 + 8, dpi, 96), cw - margin * 2);
+        int bw = (std::min)(MulDiv(n * 128 + 8 + 40, dpi, 96), cw - margin * 2);
         int bh = MulDiv(44, dpi, 96);
         int bx = (cw - bw) / 2;
         int by = ch - margin * 2 - bh;
@@ -373,15 +361,7 @@ void layout_chrome(App *app) {
 }
 
 void show_settings_button(App *app, bool show) {
-    if (!app->settings_hwnd) {
-        return;
-    }
-    ShowWindow(app->settings_hwnd, show ? SW_SHOWNA : SW_HIDE);
-    if (show) {
-        SetWindowPos(app->settings_hwnd, HWND_TOP, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-    }
-    // The scene bar comes and goes with the gear; it sits over the window only, never in a recording.
+    // The scene bar (gear included) sits over the window only, never in a recording.
     if (app->scenes_hwnd) {
         ShowWindow(app->scenes_hwnd, show ? SW_SHOWNA : SW_HIDE);
         if (show) {
@@ -958,9 +938,11 @@ void show_tray_menu(App *app) {
 }
 
 void show_corner_menu(App *app) {
+    // Opens upward from the gear at the right end of the scene bar.
     RECT rc = {};
-    GetWindowRect(app->settings_hwnd, &rc);
-    POINT pt = {rc.left, rc.bottom + MulDiv(4, window_dpi(app->hwnd), 96)};
+    GetWindowRect(app->scenes_hwnd, &rc);
+    UINT dpi = window_dpi(app->hwnd);
+    POINT pt = {rc.right - MulDiv(40, dpi, 96), rc.top - MulDiv(4, dpi, 96)};
     popup_settings_menu(app, pt, false);
 }
 
@@ -1162,57 +1144,26 @@ void apply_hit(App *app, airscreen::UiHit hit) {
     }
 }
 
-void paint_gear(HWND hwnd, HDC hdc, bool hot) {
+// The scene bar's gear: a circle at its right end, inset by the same pad as the scene pills.
+RECT scene_gear_rect(HWND hwnd) {
     RECT rc = {};
     GetClientRect(hwnd, &rc);
-    int w = rc.right;
-    int h = rc.bottom;
-    HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
-    HGDIOBJ old_bmp = SelectObject(mem, bmp);
-
-    // Continuity plate body at rest; plate-hi on hover.
-    COLORREF fill = hot ? RGB(58, 58, 60) : RGB(44, 44, 46);
-    HBRUSH b = CreateSolidBrush(fill);
-    FillRect(mem, &rc, b);
-    DeleteObject(b);
-
-    // Hairline rim: glass edge, brighter on hover.
-    HPEN rim = CreatePen(PS_SOLID, 1, hot ? RGB(120, 120, 124) : RGB(96, 96, 100));
-    HGDIOBJ old_pen = SelectObject(mem, rim);
-    HGDIOBJ old_br = SelectObject(mem, GetStockObject(NULL_BRUSH));
-    Ellipse(mem, 0, 0, w - 1, h - 1);
-    SelectObject(mem, old_br);
-    SelectObject(mem, old_pen);
-    DeleteObject(rim);
-
-    SetBkMode(mem, TRANSPARENT);
-    SetTextColor(mem, RGB(245, 245, 247));
-    // Optical: MDL2 gear sits heavy; size a hair under the circle for balance.
-    int px = MulDiv(17, window_dpi(hwnd), 96);
-    HFONT font = CreateFontW(px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe MDL2 Assets");
-    HGDIOBJ old_font = SelectObject(mem, font);
-    RECT text_rc = rc;
-    text_rc.top -= 1; // optical vertical center
-    DrawTextW(mem, L"", -1, &text_rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    SelectObject(mem, old_font);
-    DeleteObject(font);
-    BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old_bmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+    int pad = MulDiv(4, window_dpi(hwnd), 96);
+    int d = rc.bottom - pad * 2;
+    return {rc.right - pad - d, pad, rc.right - pad, rc.bottom - pad};
 }
 
 int scene_segment(HWND hwnd, int x) {
     if (!g_app) {
         return -1;
     }
+    RECT gear = scene_gear_rect(hwnd);
+    if (x >= gear.left && x < gear.right) {
+        return kSceneGear;
+    }
     int n = (std::max)(1, bar_scenes(g_app));
-    RECT rc = {};
-    GetClientRect(hwnd, &rc);
     int pad = MulDiv(4, window_dpi(hwnd), 96);
-    int seg = (rc.right - pad * 2) / n;
+    int seg = (gear.left - pad * 2) / n;
     if (seg <= 0 || x < pad || x >= pad + seg * n) {
         return -1;
     }
@@ -1233,7 +1184,8 @@ void paint_scenes(HWND hwnd, HDC hdc, int current, int hot) {
 
     int n = (std::max)(1, bar_scenes(g_app));
     int pad = MulDiv(4, dpi, 96);
-    int seg = (w - pad * 2) / n;
+    RECT gear = scene_gear_rect(hwnd);
+    int seg = (gear.left - pad * 2) / n;
     HFONT font = CreateFontW(-MulDiv(13, dpi, 96), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     HGDIOBJ old_font = SelectObject(mem, font);
@@ -1260,6 +1212,35 @@ void paint_scenes(HWND hwnd, HDC hdc, int current, int hot) {
     }
     SelectObject(mem, old_font);
     DeleteObject(font);
+
+    // Settings gear after a hairline divider; a faint circle on hover, like the scene pills.
+    HPEN rule = CreatePen(PS_SOLID, 1, RGB(64, 64, 70));
+    HGDIOBJ op = SelectObject(mem, rule);
+    int rx = gear.left - pad / 2 - 1;
+    MoveToEx(mem, rx, h / 2 - MulDiv(9, dpi, 96), nullptr);
+    LineTo(mem, rx, h / 2 + MulDiv(9, dpi, 96));
+    SelectObject(mem, op);
+    DeleteObject(rule);
+    if (hot == kSceneGear) {
+        HBRUSH b = CreateSolidBrush(RGB(58, 58, 64));
+        HGDIOBJ ob = SelectObject(mem, b);
+        op = SelectObject(mem, GetStockObject(NULL_PEN));
+        Ellipse(mem, gear.left, gear.top, gear.right + 1, gear.bottom + 1);
+        SelectObject(mem, ob);
+        SelectObject(mem, op);
+        DeleteObject(b);
+    }
+    HFONT glyph = CreateFontW(MulDiv(17, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                              L"Segoe MDL2 Assets");
+    old_font = SelectObject(mem, glyph);
+    SetTextColor(mem, RGB(225, 225, 230));
+    RECT g = gear;
+    g.top -= 1; // optical vertical center
+    DrawTextW(mem, L"", -1, &g, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(mem, old_font);
+    DeleteObject(glyph);
+
     BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old_bmp);
     DeleteObject(bmp);
@@ -1303,8 +1284,13 @@ LRESULT CALLBACK scenes_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) 
         return 0;
     case WM_LBUTTONUP:
         if (app) {
-            app->go_live(scene_segment(hwnd, GET_X_LPARAM(lparam)));
-            note_activity(app);
+            int hit = scene_segment(hwnd, GET_X_LPARAM(lparam));
+            if (hit == kSceneGear) {
+                show_corner_menu(app);
+            } else {
+                app->go_live(hit);
+                note_activity(app);
+            }
         }
         return 0;
     case WM_SETCURSOR:
@@ -1336,50 +1322,6 @@ LRESULT CALLBACK video_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         MapWindowPoints(hwnd, parent, &pt, 1);
         return SendMessageW(parent, msg, wparam, MAKELPARAM(pt.x, pt.y));
     }
-    }
-    return DefWindowProcW(hwnd, msg, wparam, lparam);
-}
-
-LRESULT CALLBACK gear_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
-    App *app = g_app;
-    switch (msg) {
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        paint_gear(hwnd, hdc, app && app->settings_hot);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-    case WM_MOUSEMOVE: {
-        TRACKMOUSEEVENT tme = {sizeof(tme), TME_LEAVE, hwnd, 0};
-        TrackMouseEvent(&tme);
-        if (app && !app->settings_hot) {
-            app->settings_hot = true;
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        if (app) {
-            note_activity(app);
-        }
-        return 0;
-    }
-    case WM_MOUSELEAVE:
-        if (app) {
-            app->settings_hot = false;
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
-        return 0;
-    case WM_LBUTTONUP:
-        if (app) {
-            show_corner_menu(app);
-        }
-        return 0;
-    case WM_SETCURSOR:
-        SetCursor(LoadCursor(nullptr, IDC_HAND));
-        return TRUE;
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
@@ -1468,7 +1410,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         if (wparam == kTimerOverlay && app->live()) {
             POINT pt = {};
             GetCursorPos(&pt);
-            if (WindowFromPoint(pt) != app->settings_hwnd) {
+            if (WindowFromPoint(pt) != app->scenes_hwnd) {
                 show_settings_button(app, false);
             }
         } else if (wparam == kTimerPin) {
@@ -1816,21 +1758,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
         return 1;
     }
 
-    WNDCLASSEXW gc = wc;
-    gc.style = 0;
-    gc.lpfnWndProc = gear_proc;
-    gc.lpszClassName = L"AirScreenGear";
-    gc.hCursor = LoadCursor(nullptr, IDC_HAND);
-    gc.hIcon = nullptr;
-    gc.hbrBackground = nullptr;
-    if (!RegisterClassExW(&gc)) {
-        airscreen::append_log("RegisterClassEx gear failed");
-        return 1;
-    }
-    WNDCLASSEXW sc = gc;
+    WNDCLASSEXW sc = wc;
+    sc.style = 0;
     sc.lpfnWndProc = scenes_proc;
     sc.lpszClassName = L"AirScreenScenes";
-    RegisterClassExW(&sc);
+    sc.hCursor = LoadCursor(nullptr, IDC_HAND);
+    sc.hIcon = nullptr;
+    sc.hbrBackground = nullptr;
+    if (!RegisterClassExW(&sc)) {
+        airscreen::append_log("RegisterClassEx scenes failed");
+        return 1;
+    }
 
     app.hwnd = CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, L"AirScreen",
                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 1100, 720,
@@ -1842,8 +1780,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
     }
     app.video_hwnd = CreateWindowExW(0, L"AirScreenVideo", L"", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 0, 0, app.hwnd,
                                      nullptr, inst, nullptr);
-    app.settings_hwnd = CreateWindowExW(0, L"AirScreenGear", L"Settings", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 40, 40,
-                                        app.hwnd, (HMENU)(INT_PTR) IDC_SETTINGS, inst, nullptr);
     app.scenes_hwnd = CreateWindowExW(0, L"AirScreenScenes", L"Scenes", WS_CHILD | WS_CLIPSIBLINGS, 0, 0, 100, 40,
                                       app.hwnd, nullptr, inst, nullptr);
     RECT saved = {app.settings_.win_x, app.settings_.win_y, app.settings_.win_x + app.settings_.win_w,
@@ -1932,7 +1868,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
         if (local_shortcut(&app, msg)) {
             continue;
         }
-        // Shortcuts work whichever of our windows (main, video surface, gear button) has focus.
+        // Shortcuts work whichever of our windows (main, video surface, scene bar) has focus.
         if (msg.message == WM_KEYDOWN && msg.hwnd != app.hwnd && app.hwnd && IsChild(app.hwnd, msg.hwnd)) {
             msg.hwnd = app.hwnd;
         }
