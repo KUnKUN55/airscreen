@@ -33,6 +33,7 @@ enum : UINT {
     kMenuHide,
     kMenuSnippet = 100,  // + snippet index
     kMenuProfile = 300,  // + profile index
+    kMenuApp = 40000,    // and up: the host's app_menu(), handled by the main window
 };
 
 const COLORREF kBg = RGB(28, 28, 32);
@@ -705,7 +706,8 @@ void ControlPanel::more_menu() {
     AppendMenuW(m, MF_POPUP, (UINT_PTR) profs, L"Teaching profile");
     AppendMenuW(m, MF_STRING | (s.panel_compact ? MF_CHECKED : 0), kMenuCompact, L"Compact view");
     AppendMenuW(m, MF_STRING | (s.panel_topmost ? MF_CHECKED : 0), kMenuTop, L"Always on top");
-    AppendMenuW(m, MF_STRING, kMenuSettings, L"Settings…");
+    AppendMenuW(m, MF_STRING, kMenuSettings, L"Teaching settings…");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR) host_->app_menu(), L"AirScreen settings");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, kMenuHide, L"Hide this panel (sharing carries on)");
 
@@ -777,6 +779,8 @@ void ControlPanel::more_menu() {
             }
         } else if (cmd >= kMenuProfile && cmd < kMenuProfile + names.size()) {
             host_->switch_profile(names[cmd - kMenuProfile]);
+        } else if (cmd >= kMenuApp) {
+            SendMessageW(host_->main_window(), WM_COMMAND, cmd, 0);
         }
         break;
     }

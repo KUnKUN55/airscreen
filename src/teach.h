@@ -101,6 +101,9 @@ public:
     // Shortcuts Windows refused (another app holds them), for the settings dialog to show.
     virtual std::wstring hotkey_problems() = 0;
     virtual HWND main_window() = 0;
+    // AirScreen's own settings (picture, pairing, main window, microphone) as a new popup menu; its items are
+    // WM_COMMANDs for main_window(), all 40000 and up.
+    virtual HMENU app_menu() = 0;
 };
 
 // Small modal dialogs (dialogs.cpp).
