@@ -5,7 +5,7 @@
   #define MyAppVersion "1.0.0"
 #endif
 #define MyAppPublisher "AirScreen"
-#define MyAppURL "https://github.com/donerfolk/airscreen"
+#define MyAppURL "https://github.com/KUnKUN55/airscreen"
 #define MyAppExeName "AirScreen.exe"
 #ifndef BuildDir
   #define BuildDir "..\build\Release"

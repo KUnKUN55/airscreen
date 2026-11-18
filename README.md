@@ -40,9 +40,9 @@ AirScreen is tested with iPhone. iPad and Mac use the same protocol and may work
 
 ## Install
 
-Download the latest installer from [Releases](https://github.com/donerfolk/airscreen/releases), or [build from source](#building-from-source).
+Download the latest installer from [Releases](https://github.com/KUnKUN55/airscreen/releases), or [build from source](#building-from-source).
 
-Every release is built from this repository by [GitHub Actions](https://github.com/donerfolk/airscreen/actions), with SHA-256 checksums in `SHA256SUMS.txt`.
+Every release is built from this repository by [GitHub Actions](https://github.com/KUnKUN55/airscreen/actions), with SHA-256 checksums in `SHA256SUMS.txt`.
 
 The installer isn't code-signed yet, so Windows SmartScreen may show "Windows protected your PC". Click **More info → Run anyway**.
 
@@ -78,7 +78,7 @@ Recording uses the same composed picture students see, so scene changes go into 
 
 **No sound.** Check the default playback device in Windows sound settings. Apps that take exclusive control of the device can block AirScreen.
 
-**Black window after connecting.** Stop mirroring and connect again. If it keeps happening, right-click the tray icon → **Open log file** and include the log in a [bug report](https://github.com/donerfolk/airscreen/issues).
+**Black window after connecting.** Stop mirroring and connect again. If it keeps happening, right-click the tray icon → **Open log file** and include the log in a [bug report](https://github.com/KUnKUN55/airscreen/issues).
 
 Settings, pairing keys and the log live in `%APPDATA%\AirScreen`.
 
