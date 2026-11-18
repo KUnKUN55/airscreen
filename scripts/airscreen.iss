@@ -44,6 +44,7 @@ CloseApplications=yes
 ; Only the DLLs AirScreen.exe imports, plus the app-local Visual C++ runtime
 Source: "{#BuildDir}\AirScreen.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\avcodec-*.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BuildDir}\avformat-*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\avutil-*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\swresample-*.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BuildDir}\libcrypto-*-x64.dll"; DestDir: "{app}"; Flags: ignoreversion
