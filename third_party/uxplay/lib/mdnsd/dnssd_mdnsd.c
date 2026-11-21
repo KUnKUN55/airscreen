@@ -356,3 +356,16 @@ void dnssd_error_text(int *dnssd_error, const  char *appname) {
         printf("Socket error %d: %s\n", sock_err, SOCKET_ERROR_STRING(sock_err));
     }
 }
+
+int
+dnssd_is_advertising(dnssd_t *dnssd_public)
+{
+    if (!dnssd_public || !dnssd_public->dnssd_private) {
+        return 0;
+    }
+    dnssd_private_t *dnssd = (dnssd_private_t *) dnssd_public->dnssd_private;
+    if (!dnssd->raop_registered && !dnssd->airplay_registered) {
+        return 0;
+    }
+    return mdnsd_healthy(dnssd->mdnsd);
+}

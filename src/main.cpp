@@ -46,6 +46,8 @@ constexpr UINT kTimerDrift = 3;
 constexpr UINT kTimerRec = 4;
 constexpr UINT kTimerPin = 5;
 constexpr UINT kTimerSave = 6;
+constexpr UINT kTimerAdvertise = 7; // checks that the iPhone can still find this PC
+constexpr UINT kAdvertiseMs = 5000;
 constexpr UINT kPinMs = 90000; // a PIN nobody typed in this long is stale
 constexpr UINT kDisconnectMs = 400;
 constexpr UINT kSaveMs = 800; // edits are saved this long after the last one
@@ -1244,6 +1246,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             }
         } else if (wparam == kTimerSave) {
             save_now(app);
+        } else if (wparam == kTimerAdvertise) {
+            app->receiver.keep_advertising();
+            SetTimer(hwnd, kTimerAdvertise, kAdvertiseMs, nullptr);
         }
         return 0;
     case WM_LBUTTONDBLCLK:
@@ -1372,6 +1377,13 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         app->panel.refresh();
         return 0;
     }
+    case WM_POWERBROADCAST:
+        if (app && wparam == PBT_APMRESUMEAUTOMATIC) {
+            // Back from sleep: the network comes up with the PC, often on a new address. Check again soon
+            // rather than waiting for the next tick.
+            SetTimer(hwnd, kTimerAdvertise, 1500, nullptr); // the tick puts the interval back to normal
+        }
+        return TRUE;
     case WM_TRAY:
         if (LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == WM_CONTEXTMENU) {
             show_tray_menu(app);
@@ -1665,6 +1677,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
                     L"AirScreen", MB_OK | MB_ICONERROR);
     } else {
         app.overlay_status = L"Ready to connect";
+        // The advertisement can stop on its own (a socket error, a new address after the network changes or the
+        // PC sleeps); without it the iPhone no longer lists this PC although everything else is running.
+        SetTimer(app.hwnd, kTimerAdvertise, kAdvertiseMs, nullptr);
         apply_video_fill(&app);
         apply_mic(&app);
         auto &video = app.receiver.video();

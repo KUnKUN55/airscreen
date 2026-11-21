@@ -43,6 +43,9 @@ public:
     void set_always_on_top_flag(bool on) { (void) on; }
     bool set_high_quality(bool on);
     void set_smooth(bool on);
+    // Call every few seconds from the UI thread: if the AirPlay advertisement stopped (its socket failed, or the
+    // PC got a new address) it is started again, so the iPhone keeps finding this PC. False while it is down.
+    bool keep_advertising();
 
     VideoPipeline &video() { return video_; }
     Recorder &recorder() { return recorder_; }
@@ -90,6 +93,7 @@ private:
     void *dnssd_ = nullptr;
     void *raop_ = nullptr;
     unsigned short raop_port_ = 0;
+    int adv_failures_ = 0; // restarts of the advertisement in a row that did not take
 
     Recorder recorder_; // declared before the pipelines so it outlives their worker threads
     VideoPipeline video_;

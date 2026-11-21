@@ -262,6 +262,27 @@ bool Receiver::rename(const std::string &name) {
     return true;
 }
 
+bool Receiver::keep_advertising() {
+    if (!raop_ || connected_.load()) {
+        // Not started; or mirroring right now, when the session's threads use the advertisement and swapping it
+        // under them is unsafe. Checked again once the iPhone disconnects.
+        return true;
+    }
+    if (dnssd_ && dnssd_is_advertising((dnssd_t *) dnssd_)) {
+        if (adv_failures_) {
+            on_log(LOGGER_INFO, "mDNS advertisement is back");
+            adv_failures_ = 0;
+        }
+        return true;
+    }
+    // Log the first failure and then only now and then, so a long outage doesn't fill the log.
+    if (adv_failures_ == 0 || adv_failures_ % 60 == 0) {
+        on_log(LOGGER_ERR, "mDNS advertisement stopped (socket error or new network address); restarting it");
+    }
+    ++adv_failures_;
+    return rename(name_) && dnssd_ && dnssd_is_advertising((dnssd_t *) dnssd_);
+}
+
 bool Receiver::set_require_pin(bool on) {
     settings_.require_pin = on;
     pin_pw_ = on ? 1 : 0;

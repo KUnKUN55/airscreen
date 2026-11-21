@@ -65,6 +65,7 @@ struct mdnsd_s {
     int sock_fd4;
     int sock_fd6;
     int running;
+    int failed; /* the socket loop hit an error; see mdnsd_healthy */
     thread_handle_t thread;
     mutex_handle_t mutex;
 };
@@ -345,7 +346,9 @@ static int mdns_query_type_matches(uint16_t query_type, uint16_t record_type)
     return query_type == record_type || query_type == DNS_TYPE_ANY;
 }
 
-static uint32_t mdns_get_default_ipv4(void)
+/* The local address a UDP socket would use to reach `dest` (nothing is sent: connect() on UDP only picks a
+ * route), or 0. */
+static uint32_t mdns_probe_ipv4(const char *dest, unsigned short port)
 {
     int fd;
     uint32_t addr = 0;
@@ -360,8 +363,8 @@ static uint32_t mdns_get_default_ipv4(void)
 
     memset(&remote, 0, sizeof(remote));
     remote.sin_family = AF_INET;
-    remote.sin_port = htons(MDNS_PORT);
-    inet_pton(AF_INET, MDNS_ADDR4, &remote.sin_addr);
+    remote.sin_port = htons(port);
+    inet_pton(AF_INET, dest, &remote.sin_addr);
 
     if (connect(fd, (struct sockaddr *) &remote, sizeof(remote)) == 0 &&
         getsockname(fd, (struct sockaddr *) &local, &local_len) == 0) {
@@ -370,6 +373,25 @@ static uint32_t mdns_get_default_ipv4(void)
 
     CLOSESOCKET(fd);
     return addr;
+}
+
+/* Loopback and link-local (no DHCP answer) addresses never reach the iPhone. */
+static int mdns_ipv4_reachable(uint32_t addr)
+{
+    const unsigned char *b = (const unsigned char *) &addr;
+    return addr != 0 && b[0] != 127 && !(b[0] == 169 && b[1] == 254);
+}
+
+/* The address of the network the iPhone is on: the interface of the default route. Asking for the route to the
+ * mDNS group itself is not enough on Windows, which has a 224.0.0.0/4 route on the loopback interface too and
+ * can answer 127.0.0.1; the responder then joins and announces on loopback and no other device ever hears it. */
+static uint32_t mdns_get_default_ipv4(void)
+{
+    uint32_t addr = mdns_probe_ipv4("8.8.8.8", 53);
+    if (!mdns_ipv4_reachable(addr)) {
+        addr = mdns_probe_ipv4(MDNS_ADDR4, MDNS_PORT); /* no default route: a LAN without internet */
+    }
+    return mdns_ipv4_reachable(addr) ? addr : 0;
 }
 
 static int mdns_get_default_ipv6(unsigned char addr[16], unsigned int *scope_id)
@@ -905,6 +927,19 @@ static THREAD_RETVAL mdns_thread(void *arg)
         tv.tv_usec = 250000;
 
         ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            /* A socket went bad under us (network stack reset, adapter gone): note it for the health check
+             * and don't spin; the owner restarts the responder. */
+            MUTEX_LOCK(mdnsd->mutex);
+            mdnsd->failed = 1;
+            MUTEX_UNLOCK(mdnsd->mutex);
+#ifdef _WIN32
+            Sleep(250);
+#else
+            usleep(250000);
+#endif
+            continue;
+        }
         if (ret > 0 && fd4 != -1 && FD_ISSET(fd4, &rfds)) {
             unsigned char buffer[MDNS_MAX_PACKET];
             struct sockaddr_in from;
@@ -1010,6 +1045,7 @@ int mdnsd_start(mdnsd_t *mdnsd)
     }
 
     mdnsd->running = 1;
+    mdnsd->failed = 0;
     THREAD_CREATE(mdnsd->thread, mdns_thread, mdnsd);
     if (!mdnsd->thread) {
         if (mdnsd->sock_fd4 != -1) {
@@ -1104,4 +1140,23 @@ void mdnsd_goodbye(mdnsd_t *mdnsd, const mdnsd_service_t *service)
     mdns_send_service_locked(mdnsd, service, 0, 0, MDNS_FAMILY_IPV4, NULL);
     mdns_send_service_locked(mdnsd, service, 0, 0, MDNS_FAMILY_IPV6, NULL);
     MUTEX_UNLOCK(mdnsd->mutex);
+}
+
+/* 1 while the responder is answering on its sockets, on the address it started with. 0 when it stopped, a socket
+ * failed, or the machine's default IPv4 address changed (DHCP renewal, another adapter, a cable re-plugged):
+ * answers would then carry the old address and go out of the wrong interface, so the iPhone can't find us. */
+int mdnsd_healthy(mdnsd_t *mdnsd)
+{
+    int ok;
+    uint32_t addr4;
+
+    if (!mdnsd) {
+        return 0;
+    }
+    addr4 = mdns_get_default_ipv4();
+    MUTEX_LOCK(mdnsd->mutex);
+    ok = mdnsd->running && !mdnsd->failed && (mdnsd->sock_fd4 != -1 || mdnsd->sock_fd6 != -1) &&
+         (addr4 == 0 || addr4 == mdnsd->ipv4_addr);
+    MUTEX_UNLOCK(mdnsd->mutex);
+    return ok;
 }
