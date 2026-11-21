@@ -41,6 +41,7 @@ const ActionInfo kActions[] = {
     {"panel", L"Show / hide control panel"},
     {"preview", L"Open preview"},
     {"edittext", L"Edit text on air"},
+    {"laser", L"Laser pointer on / off"},
 };
 static_assert(sizeof(kActions) / sizeof(kActions[0]) == (size_t) Action::kCount, "one entry per action");
 
@@ -106,12 +107,28 @@ std::vector<Hotkey> default_hotkeys() {
         {Action::ShowIPad, m, 'I'},         {Action::ShowComputer, m, 'C'}, {Action::ShowBoth, m, 'B'},
         {Action::ToggleSecondary, m, 'S'},  {Action::ToggleText, m, 'T'},   {Action::TogglePanel, m, 'P'},
         {Action::NextScene, m, VK_RIGHT},   {Action::PrevScene, m, VK_LEFT}, {Action::ToggleRecord, m, 'R'},
-        {Action::PauseRecord, m, VK_SPACE},
+        {Action::PauseRecord, m, VK_SPACE}, {Action::Laser, m, 'L'},
     };
     for (int i = 0; i < 9; ++i) {
         k.push_back({(Action) ((int) Action::Scene1 + i), m, (UINT) ('1' + i)});
     }
     return k;
+}
+
+std::vector<Hotkey> load_hotkeys(const std::string &map) {
+    if (map.empty()) {
+        return default_hotkeys();
+    }
+    std::vector<Hotkey> keys = parse_hotkeys(map);
+    for (const Hotkey &d : default_hotkeys()) {
+        bool known = std::any_of(keys.begin(), keys.end(), [&](const Hotkey &k) { return k.action == d.action; });
+        bool taken = std::any_of(keys.begin(), keys.end(),
+                                 [&](const Hotkey &k) { return k.vk && k.vk == d.vk && k.mods == d.mods; });
+        if (!known && !taken) {
+            keys.push_back(d);
+        }
+    }
+    return keys;
 }
 
 std::wstring hotkey_text(UINT mods, UINT vk) {

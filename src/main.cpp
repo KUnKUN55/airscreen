@@ -5,6 +5,7 @@
 #include "control.h"
 #include "editor.h"
 #include "teach.h"
+#include "laser.h"
 #include "app/resource.h"
 #include "raop.h"
 
@@ -84,6 +85,7 @@ struct App : airscreen::TeachHost {
     airscreen::Scene live_scene_; // its working copy: quick actions change this, not the saved scene
     airscreen::ControlPanel panel;
     airscreen::SceneEditor editor;
+    airscreen::LaserPointer laser;
     std::wstring computer_name;
     std::wstring message; // last problem worth showing on the control panel
     std::vector<airscreen::Hotkey> hotkeys;
@@ -611,6 +613,11 @@ void App::run(airscreen::Action a) {
     case Action::EditText:
         airscreen::edit_live_text(dialog_owner(), this);
         return;
+    case Action::Laser:
+        laser.set_style(settings_.laser_color, settings_.laser_size);
+        laser.set_on(inst, !laser.on());
+        panel.refresh();
+        return;
     default:
         if (a >= Action::Scene1 && a <= Action::Scene9) {
             go_live((int) a - (int) Action::Scene1);
@@ -657,6 +664,7 @@ airscreen::TeachStatus App::status() {
     st.paused = recording && receiver.recorder().paused();
     st.rec_seconds = recording ? receiver.recorder().seconds() : 0;
     st.mic = receiver.recorder().mic_running();
+    st.laser = laser.on();
     st.message = message;
     return st;
 }
@@ -743,8 +751,7 @@ void register_hotkeys(App *app) {
     }
     app->registered_hotkeys = 0;
     app->hotkey_problems_.clear();
-    app->hotkeys = app->settings_.hotkey_map.empty() ? airscreen::default_hotkeys()
-                                                     : airscreen::parse_hotkeys(app->settings_.hotkey_map);
+    app->hotkeys = airscreen::load_hotkeys(app->settings_.hotkey_map);
     if (!app->settings_.hotkeys) {
         return;
     }
@@ -763,6 +770,7 @@ void register_hotkeys(App *app) {
 
 void App::prefs_changed() {
     register_hotkeys(this);
+    laser.set_style(settings_.laser_color, settings_.laser_size);
     panel.apply_prefs();
     if (editor.is_open()) {
         airscreen::hide_from_capture(editor.hwnd(), settings_.hide_controls);
@@ -1257,6 +1265,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             toggle_mic(app);
         } else if (wparam == 'T' && ctrl) {
             app->panel.toggle();
+        } else if (wparam == 'L' && ctrl) {
+            app->run(airscreen::Action::Laser);
         } else if (wparam >= '1' && wparam <= '9' && !ctrl) {
             app->go_live((int) (wparam - '1'));
         } else if (wparam >= VK_NUMPAD1 && wparam <= VK_NUMPAD9) {
@@ -1371,6 +1381,7 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         save_now(app);
         app->editor.close();
+        app->laser.destroy();
         app->panel.destroy();
         for (int i = 0; i < app->registered_hotkeys; ++i) {
             UnregisterHotKey(hwnd, i + 1);

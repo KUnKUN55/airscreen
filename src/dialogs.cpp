@@ -482,7 +482,7 @@ INT_PTR CALLBACK pref_keys_proc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         EnableThemeDialogTexture(h, ETDT_ENABLETAB);
         Settings &s = st->host->settings();
         CheckDlgButton(h, IDC_PK_ENABLE, s.hotkeys ? BST_CHECKED : BST_UNCHECKED);
-        std::vector<Hotkey> saved = s.hotkey_map.empty() ? default_hotkeys() : parse_hotkeys(s.hotkey_map);
+        std::vector<Hotkey> saved = load_hotkeys(s.hotkey_map);
         for (Action a : listed_actions()) {
             Hotkey k{a, 0, 0};
             for (auto &h2 : saved) {

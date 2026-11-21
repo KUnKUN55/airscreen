@@ -199,6 +199,12 @@ Settings load_settings() {
             s.hotkeys = (val == "1" || val == "true");
         } else if (key == "HotkeyMap") {
             s.hotkey_map = val;
+        } else if (key == "LaserColor") {
+            int v = atoi(val.c_str());
+            s.laser_color = v < 0 || v > 3 ? 0 : v;
+        } else if (key == "LaserSize") {
+            int v = atoi(val.c_str());
+            s.laser_size = v < 0 || v > 2 ? 1 : v;
         }
     }
     return s;
@@ -247,6 +253,8 @@ void save_settings(const Settings &s) {
     out << "Quick=" << s.quick << "\n";
     out << "Hotkeys=" << (s.hotkeys ? 1 : 0) << "\n";
     out << "HotkeyMap=" << s.hotkey_map << "\n";
+    out << "LaserColor=" << s.laser_color << "\n";
+    out << "LaserSize=" << s.laser_size << "\n";
 }
 
 std::string find_mac_address() {

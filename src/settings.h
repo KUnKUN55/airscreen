@@ -49,6 +49,8 @@ struct Settings {
     std::string quick = "ipad,computer,both,text"; // control panel quick buttons, by action name
     bool hotkeys = false;          // shortcuts that work while other apps are in front
     std::string hotkey_map;        // "action:mods:vk,..."; empty = the defaults
+    int laser_color = 0;           // laser pointer: 0 red, 1 green, 2 blue, 3 yellow
+    int laser_size = 1;            // 0 small, 1 medium, 2 large
 };
 
 std::wstring app_data_dir();

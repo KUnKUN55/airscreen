@@ -31,6 +31,9 @@ enum : UINT {
     kMenuTop,
     kMenuSettings,
     kMenuHide,
+    kMenuLaser,
+    kMenuLaserColor = 60, // + color index
+    kMenuLaserSize = 70,  // + size index
     kMenuSnippet = 100,  // + snippet index
     kMenuProfile = 300,  // + profile index
     kMenuApp = 40000,    // and up: the host's app_menu(), handled by the main window
@@ -260,6 +263,8 @@ bool ControlPanel::action_lit(Action a, const Scene &s, const TeachStatus &st) c
         return st.paused;
     case Action::ToggleRecord:
         return st.recording;
+    case Action::Laser:
+        return st.laser;
     default:
         return false;
     }
@@ -391,6 +396,9 @@ void ControlPanel::layout(HDC hdc, int width) {
                 break;
             case Action::EditText:
                 b.label = L"✎ Text…";
+                break;
+            case Action::Laser:
+                b.label = L"Laser";
                 break;
             default:
                 break;
@@ -695,6 +703,19 @@ void ControlPanel::more_menu() {
     AppendMenuW(comp, MF_STRING | (st.computer || st.computer_wait ? 0 : MF_GRAYED), kMenuStopComputer,
                 L"Stop sharing the computer screen");
     AppendMenuW(m, MF_POPUP, (UINT_PTR) comp, L"Computer screen");
+    HMENU las = CreatePopupMenu();
+    AppendMenuW(las, MF_STRING | (st.laser ? MF_CHECKED : 0), kMenuLaser, L"Laser pointer on");
+    AppendMenuW(las, MF_SEPARATOR, 0, nullptr);
+    const wchar_t *colors[] = {L"Red", L"Green", L"Blue", L"Yellow"};
+    for (UINT i = 0; i < 4; ++i) {
+        AppendMenuW(las, MF_STRING | (s.laser_color == (int) i ? MF_CHECKED : 0), kMenuLaserColor + i, colors[i]);
+    }
+    AppendMenuW(las, MF_SEPARATOR, 0, nullptr);
+    const wchar_t *sizes[] = {L"Small", L"Medium", L"Large"};
+    for (UINT i = 0; i < 3; ++i) {
+        AppendMenuW(las, MF_STRING | (s.laser_size == (int) i ? MF_CHECKED : 0), kMenuLaserSize + i, sizes[i]);
+    }
+    AppendMenuW(m, MF_POPUP, (UINT_PTR) las, L"Laser pointer");
     AppendMenuW(m, MF_STRING, kMenuKeep, L"Keep these changes in the scene");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     HMENU profs = CreatePopupMenu();
@@ -768,7 +789,22 @@ void ControlPanel::more_menu() {
     case kMenuHide:
         hide();
         break;
+    case kMenuLaser:
+        host_->run(Action::Laser);
+        break;
     default:
+        if (cmd >= kMenuLaserColor && cmd < kMenuLaserColor + 4) {
+            s.laser_color = (int) (cmd - kMenuLaserColor);
+            host_->save_settings();
+            host_->prefs_changed();
+            break;
+        }
+        if (cmd >= kMenuLaserSize && cmd < kMenuLaserSize + 3) {
+            s.laser_size = (int) (cmd - kMenuLaserSize);
+            host_->save_settings();
+            host_->prefs_changed();
+            break;
+        }
         if (cmd >= kMenuSnippet && cmd < kMenuSnippet + prof.snippets.size()) {
             Scene live = host_->live_scene();
             if (Layer *t = main_text(live)) {

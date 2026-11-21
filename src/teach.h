@@ -35,6 +35,7 @@ enum class Action {
     TogglePanel,
     Preview,
     EditText,
+    Laser,
     kCount
 };
 
@@ -51,6 +52,8 @@ struct Hotkey {
 std::vector<Hotkey> parse_hotkeys(const std::string &s);
 std::string format_hotkeys(const std::vector<Hotkey> &keys);
 std::vector<Hotkey> default_hotkeys();
+// The saved map (empty: the defaults), plus the default key of any action added since it was saved.
+std::vector<Hotkey> load_hotkeys(const std::string &map);
 std::wstring hotkey_text(UINT mods, UINT vk);
 
 // What the control panel shows; read fresh every time it paints, so it is never out of date.
@@ -64,6 +67,7 @@ struct TeachStatus {
     bool paused = false;
     double rec_seconds = 0;
     bool mic = false;
+    bool laser = false; // the laser pointer is on
     std::wstring message; // last problem worth telling (a capture that ended, a save that failed)
 };
 

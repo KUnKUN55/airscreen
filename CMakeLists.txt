@@ -137,6 +137,7 @@ add_executable(AirScreen WIN32
     src/control.cpp
     src/editor.cpp
     src/dialogs.cpp
+    src/laser.cpp
     src/settings.cpp
     src/ui.cpp
     src/openssl_applink.c
@@ -173,7 +174,7 @@ if (MSVC)
         src/main.cpp src/receiver.cpp src/video.cpp src/audio.cpp src/recorder.cpp src/mic.cpp src/studio.cpp src/settings.cpp
         PROPERTIES COMPILE_OPTIONS "/utf-8;/W3;/wd4996;/FI${COMPAT_DIR}/airscreen_types.h")
     set_source_files_properties(src/ui.cpp src/scene.cpp src/teach.cpp src/control.cpp src/editor.cpp src/dialogs.cpp
-        PROPERTIES COMPILE_OPTIONS "/utf-8;/W3")
+        src/laser.cpp PROPERTIES COMPILE_OPTIONS "/utf-8;/W3")
     # Windows.Graphics.Capture through C++/WinRT. C++20 so it uses <coroutine>:
     # newer MSVC rejects the experimental coroutine header C++/WinRT picks under C++17.
     set_source_files_properties(src/capture.cpp PROPERTIES COMPILE_OPTIONS "/utf-8;/W3;/bigobj;/std:c++20")
