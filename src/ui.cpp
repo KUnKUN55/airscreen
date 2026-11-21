@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -49,26 +50,27 @@ struct Field {
     Color ink; // label ink on a control flooded white
 };
 
-// Dusk tones: saturated enough to name the state, soft enough to sit beside a desk lamp all evening.
+// Forest and earth: a deep woodland green while waiting, warm bark while pairing, a cool pine once mirroring,
+// and wet slate when something failed. Blooms of moss and sunlit tan keep the fields from reading as flat paint.
 Field field_for(Mood mood) {
     switch (mood) {
     case Mood::Pair:
-        return {Color(255, 110, 68, 24), Color(255, 42, 24, 10), Color(153, 217, 151, 74), Color(115, 184, 106, 90),
-                Color(255, 62, 36, 14)};
+        return {Color(255, 124, 84, 52), Color(255, 50, 32, 20), Color(150, 226, 184, 120), Color(110, 170, 120, 76),
+                Color(255, 74, 46, 26)};
     case Mood::Live:
-        return {Color(255, 26, 80, 64), Color(255, 8, 32, 26), Color(133, 84, 178, 126), Color(92, 74, 134, 216),
-                Color(255, 12, 52, 40)};
+        return {Color(255, 30, 84, 76), Color(255, 9, 34, 32), Color(130, 104, 176, 150), Color(92, 196, 168, 116),
+                Color(255, 16, 56, 50)};
     case Mood::Fail:
-        return {Color(255, 48, 48, 54), Color(255, 21, 21, 24), Color(82, 192, 90, 80), Color(128, 78, 78, 86),
-                Color(255, 30, 30, 34)};
+        return {Color(255, 62, 60, 56), Color(255, 24, 23, 22), Color(96, 196, 112, 88), Color(110, 120, 112, 98),
+                Color(255, 36, 34, 32)};
     default:
-        return {Color(255, 28, 50, 114), Color(255, 11, 21, 54), Color(158, 74, 134, 216), Color(128, 109, 91, 196),
-                Color(255, 19, 36, 90)};
+        return {Color(255, 40, 94, 72), Color(255, 13, 40, 31), Color(150, 128, 176, 116), Color(104, 206, 164, 112),
+                Color(255, 28, 66, 50)};
     }
 }
 
-const Color c_label(255, 255, 255, 255);
-const Color c_soft(214, 255, 255, 255); // secondary text is the field's own light, never gray
+const Color c_label(255, 250, 244, 232); // warm cream, like the paper in the leaves
+const Color c_soft(222, 240, 230, 210);  // secondary text: the same cream, a touch quieter, never gray
 
 const wchar_t *pick_face(std::initializer_list<const wchar_t *> faces) {
     for (auto *name : faces) {
@@ -393,6 +395,110 @@ void icon_moon(Graphics &g, RectF b, const Color &c, float w) {
     g.DrawPath(&p, &path);
 }
 
+// A laser pointer: a short beam ending in a lit spot.
+void icon_laser(Graphics &g, RectF b, const Color &c, float w) {
+    Pen p(c, w);
+    round_pen(p);
+    auto P = [&](float u, float v) { return PointF(b.X + u * b.Width, b.Y + v * b.Height); };
+    g.DrawLine(&p, P(0.12f, 0.88f), P(0.52f, 0.48f));
+    SolidBrush spot(c);
+    float r = 0.17f * b.Width;
+    PointF s = P(0.68f, 0.32f);
+    g.FillEllipse(&spot, s.X - r, s.Y - r, r * 2, r * 2);
+    Pen ray(Color((BYTE) (c.GetA() * 0.7f), c.GetR(), c.GetG(), c.GetB()), w * 0.8f);
+    round_pen(ray);
+    g.DrawLine(&ray, P(0.68f, 0.02f), P(0.68f, 0.10f));
+    g.DrawLine(&ray, P(0.98f, 0.32f), P(0.90f, 0.32f));
+    g.DrawLine(&ray, P(0.90f, 0.10f), P(0.84f, 0.16f));
+}
+
+// One leaf, drawn along +x from its stem at (x, y) and turned by `deg` (clockwise, as the screen's y runs down):
+// two curves for the blade, a light midrib and paired veins clipped to the blade, like the pressed-paper leaves
+// of the theme.
+struct LeafTone {
+    Color a, b; // the lit side and the shaded side
+};
+
+void draw_leaf(Graphics &g, float x, float y, float len, float half_w, float deg, const LeafTone &tone, bool dark) {
+    auto dim = [dark](const Color &c) {
+        if (!dark) {
+            return c;
+        }
+        return Color(c.GetA(), (BYTE) (c.GetR() * 0.5f), (BYTE) (c.GetG() * 0.5f), (BYTE) (c.GetB() * 0.5f));
+    };
+    Gdiplus::Region old_clip;
+    g.GetClip(&old_clip);
+    Gdiplus::Matrix old;
+    g.GetTransform(&old);
+    g.TranslateTransform(x, y);
+    g.RotateTransform(deg);
+
+    GraphicsPath blade;
+    blade.AddBezier(PointF(0, 0), PointF(len * 0.22f, -half_w * 1.25f), PointF(len * 0.70f, -half_w * 1.0f),
+                    PointF(len, 0));
+    blade.AddBezier(PointF(len, 0), PointF(len * 0.70f, half_w * 1.0f), PointF(len * 0.22f, half_w * 1.25f),
+                    PointF(0, 0));
+    blade.CloseFigure();
+    LinearGradientBrush fill(RectF(0, -half_w * 1.1f, len, half_w * 2.2f), dim(tone.a), dim(tone.b), 90.f);
+    g.FillPath(&fill, &blade);
+
+    Pen stem(dim(tone.b), (std::max)(1.2f, half_w * 0.08f));
+    stem.SetStartCap(LineCapRound);
+    g.DrawLine(&stem, -len * 0.10f, half_w * 0.04f, len * 0.02f, 0.f);
+
+    g.SetClip(&blade, Gdiplus::CombineModeIntersect);
+    Color vein_c(dark ? 34 : 64, 255, 248, 230);
+    Pen rib(vein_c, (std::max)(1.f, half_w * 0.06f));
+    g.DrawLine(&rib, len * 0.02f, 0.f, len * 0.96f, 0.f);
+    Pen vein(Color((BYTE) (vein_c.GetA() * 0.7f), 255, 248, 230), (std::max)(0.8f, half_w * 0.035f));
+    for (int i = 1; i <= 6; ++i) {
+        float u = (float) i / 7.5f;
+        float reach = half_w * 0.95f * (1.f - u * 0.5f);
+        g.DrawLine(&vein, len * u, 0.f, len * (u + 0.14f), -reach);
+        g.DrawLine(&vein, len * u, 0.f, len * (u + 0.14f), reach);
+    }
+    g.SetTransform(&old);
+    g.SetClip(&old_clip);
+}
+
+// Sprays of leaves reaching in from the corners. Positions are offsets from a corner in units of the window's
+// short side, so the sprays keep their shape at any window size.
+void draw_leaves(Graphics &g, int w, int h, bool dark, bool lower) {
+    static const LeafTone tones[] = {
+        {Color(255, 74, 132, 98), Color(255, 30, 76, 56)},   // forest
+        {Color(255, 150, 186, 142), Color(255, 86, 128, 92)}, // sage
+        {Color(255, 104, 154, 104), Color(255, 48, 98, 66)},  // moss
+        {Color(255, 226, 196, 150), Color(255, 168, 126, 84)}, // dry tan
+        {Color(255, 164, 110, 70), Color(255, 102, 62, 36)},  // bark brown
+    };
+    struct Leaf {
+        float du, dv, len, wr, deg;
+        int tone;
+    };
+    static const Leaf top_right[] = {
+        {-0.26f, -0.05f, 0.17f, 0.24f, 84, 4}, {-0.16f, -0.04f, 0.22f, 0.22f, 96, 3},
+        {0.03f, 0.34f, 0.22f, 0.21f, 176, 0},  {-0.07f, -0.03f, 0.27f, 0.22f, 108, 1},
+        {0.02f, 0.16f, 0.28f, 0.20f, 156, 2},  {0.01f, -0.02f, 0.34f, 0.21f, 128, 0},
+    };
+    static const Leaf bottom_right[] = {
+        {-0.22f, 0.04f, 0.16f, 0.22f, -98, 1},
+        {-0.10f, 0.03f, 0.22f, 0.22f, -114, 3},
+        {0.03f, -0.13f, 0.22f, 0.20f, -164, 2},
+        {0.02f, 0.02f, 0.27f, 0.21f, -138, 0},
+    };
+    float S = (float) (std::min)(w, h);
+    for (auto &l : top_right) {
+        float len = l.len * S;
+        draw_leaf(g, (float) w + l.du * S, l.dv * S, len, len * l.wr, l.deg, tones[l.tone], dark);
+    }
+    if (lower) {
+        for (auto &l : bottom_right) {
+            float len = l.len * S;
+            draw_leaf(g, (float) w + l.du * S, (float) h + l.dv * S, len, len * l.wr, l.deg, tones[l.tone], dark);
+        }
+    }
+}
+
 void chevron(Graphics &g, float x, float mid, float s, const Color &c, float w) {
     Pen p(c, w);
     round_pen(p);
@@ -481,6 +587,7 @@ void ShellUi::startup() {
 
 void ShellUi::shutdown() {
     destroy_icons();
+    drop_cache();
 }
 
 void ShellUi::ensure_icons() {
@@ -503,6 +610,53 @@ void ShellUi::destroy_icons() {
     }
 }
 
+void ShellUi::drop_cache() {
+    if (cache_dc_) {
+        SelectObject(cache_dc_, cache_old_);
+        DeleteDC(cache_dc_);
+        cache_dc_ = nullptr;
+    }
+    if (cache_bmp_) {
+        DeleteObject(cache_bmp_);
+        cache_bmp_ = nullptr;
+    }
+    cache_bits_ = nullptr;
+    cache_w_ = cache_h_ = 0;
+    cache_key_.clear();
+    base_.clear();
+    base_.shrink_to_fit();
+    base_key_.clear();
+}
+
+bool ShellUi::ensure_cache(HDC hdc, int w, int h) {
+    if (cache_bmp_ && cache_w_ == w && cache_h_ == h) {
+        return true;
+    }
+    drop_cache();
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h; // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    cache_dc_ = CreateCompatibleDC(hdc);
+    if (!cache_dc_) {
+        return false;
+    }
+    cache_bmp_ = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &cache_bits_, nullptr, 0);
+    if (!cache_bmp_ || !cache_bits_) {
+        DeleteDC(cache_dc_);
+        cache_dc_ = nullptr;
+        cache_bmp_ = nullptr;
+        cache_bits_ = nullptr;
+        return false;
+    }
+    cache_old_ = SelectObject(cache_dc_, cache_bmp_);
+    cache_w_ = w;
+    cache_h_ = h;
+    return true;
+}
+
 void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hover) {
     client_ = client;
     int w = client.right - client.left;
@@ -510,26 +664,95 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
     if (w < 2 || h < 2) {
         return;
     }
-    dpi_ = hwnd ? (int) GetDpiForWindow(hwnd) : 96;
-    if (dpi_ < 96) {
-        dpi_ = 96;
+    int dpi = hwnd ? (int) GetDpiForWindow(hwnd) : 96;
+    dpi = (std::max)(dpi, 96);
+    if (dpi != dpi_) {
+        dpi_ = dpi;
+        cache_key_.clear();
+        base_key_.clear();
     }
     auto D = [this](float v) { return v * (float) dpi_ / 96.f; };
+    if (!ensure_cache(hdc, w, h)) {
+        // Out of memory for a picture this size: plain ground rather than nothing at all.
+        HBRUSH b = CreateSolidBrush(RGB(16, 44, 34));
+        FillRect(hdc, &client, b);
+        DeleteObject(b);
+        return;
+    }
 
-    BITMAPINFO bi = {};
-    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h; // top-down
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    void *bits = nullptr;
+    wchar_t head[128];
+    swprintf_s(head, L"%d|%d|%d|%d|%d%d%d%d%d%d%d|", w, h, dpi_, hover, (int) view.connected,
+               (int) view.always_on_top, (int) view.require_pin, (int) view.fullscreen, (int) view.dark,
+               (int) view.laser, (int) view.failed);
+    std::wstring key = head + view.name + L'\x1f' + view.status + L'\x1f' + view.pin + L'\x1f' + view.detail;
+    if (key != cache_key_) {
+        paint_still(w, h, view, hover);
+        GdiFlush();
+        cache_key_ = key;
+    }
+
+    // Only what Windows asked to have repainted: on an animation tick, that is the small moving area.
+    RECT clip = client;
+    RECT box;
+    if (GetClipBox(hdc, &box) != ERROR && box.right > box.left && box.bottom > box.top) {
+        IntersectRect(&clip, &box, &client);
+    }
+    int cw = clip.right - clip.left, ch = clip.bottom - clip.top;
+    if (cw <= 0 || ch <= 0) {
+        return;
+    }
     HDC mem = CreateCompatibleDC(hdc);
-    HBITMAP bm = CreateDIBSection(hdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP bm = mem ? CreateCompatibleBitmap(hdc, cw, ch) : nullptr;
     if (!bm) {
-        DeleteDC(mem);
+        if (mem) {
+            DeleteDC(mem);
+        }
+        BitBlt(hdc, clip.left, clip.top, cw, ch, cache_dc_, clip.left, clip.top, SRCCOPY);
         return;
     }
     HGDIOBJ old = SelectObject(mem, bm);
+    BitBlt(mem, 0, 0, cw, ch, cache_dc_, clip.left, clip.top, SRCCOPY);
+    {
+        Graphics g(mem);
+        g.SetSmoothingMode(SmoothingModeAntiAlias);
+        g.TranslateTransform((float) -clip.left, (float) -clip.top);
+        double t = drift_allowed() ? (double) GetTickCount64() / 1000.0 : 0.0;
+        if (show_logo_) {
+            float fy = float_logo_ ? D(5) * (float) sin(t * 0.9) : 0.f;
+            float k = float_logo_ ? 0.5f + 0.5f * (float) sin(t * 1.6) : 0.4f;
+            float s = logo_s_, cx = logo_x_ + s * 0.5f, cy = logo_y_ + s * 0.5f + fy;
+            GraphicsPath glow;
+            glow.AddEllipse(cx - s * 0.52f, cy - s * 0.36f, s * 1.04f, s * 0.72f);
+            Gdiplus::PathGradientBrush pg(&glow);
+            Color gc(glow_argb_);
+            pg.SetCenterColor(Color((BYTE) (36 + 46 * k), gc.GetR(), gc.GetG(), gc.GetB()));
+            Color edge(0, gc.GetR(), gc.GetG(), gc.GetB());
+            int n = 1;
+            pg.SetSurroundColors(&edge, &n);
+            g.FillPath(&pg, &glow);
+            draw_logo_image(g, RectF(logo_x_, logo_y_ + fy, s, s));
+        }
+        if (dot_r_ > 0) {
+            Color dot(dot_argb_);
+            if (breathe_) {
+                // A slow breathing halo while waiting: alive, never insistent.
+                float k = 0.5f + 0.5f * (float) sin(t * 2.2);
+                float hr = dot_r_ + dot_r_ * k;
+                fill_round(g, RectF(dot_x_ - hr, dot_y_ - hr, hr * 2, hr * 2), hr,
+                           Color((BYTE) (70 * (1.f - k) + 20), dot.GetR(), dot.GetG(), dot.GetB()));
+            }
+            fill_round(g, RectF(dot_x_ - dot_r_, dot_y_ - dot_r_, dot_r_ * 2, dot_r_ * 2), dot_r_, dot);
+        }
+    }
+    BitBlt(hdc, clip.left, clip.top, cw, ch, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(bm);
+    DeleteDC(mem);
+}
+
+void ShellUi::paint_still(int w, int h, const UiView &view, int hover) {
+    auto D = [this](float v) { return v * (float) dpi_ / 96.f; };
+    uint32_t *bits = (uint32_t *) cache_bits_;
 
     Mood mood = view.failed         ? Mood::Fail
                 : !view.pin.empty() ? Mood::Pair
@@ -538,24 +761,21 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
     Field f = field_for(mood);
     if (view.dark) {
         // Dark mode: the same fields at about a third of their brightness with faint blooms, so waiting becomes a
-        // deep midnight blue and the other states still read by hue.
+        // night forest and the other states still read by hue.
         auto dim = [](Color &c, float k, float alpha) {
             c = Color((BYTE) (c.GetA() * alpha), (BYTE) (c.GetR() * k), (BYTE) (c.GetG() * k), (BYTE) (c.GetB() * k));
         };
-        dim(f.top, 0.35f, 1.f);
-        dim(f.bottom, 0.35f, 1.f);
+        dim(f.top, 0.38f, 1.f);
+        dim(f.bottom, 0.38f, 1.f);
         dim(f.bloom_a, 0.6f, 0.45f);
         dim(f.bloom_b, 0.6f, 0.45f);
     }
-    // Waiting drifts free; a PIN or a failure holds the field still so the state reads at once.
-    bool drift = (mood == Mood::Wait || mood == Mood::Live) && drift_allowed();
-    fill_field((uint32_t *) bits, w, h, f, drift ? (double) GetTickCount64() / 1000.0 : 0.0);
 
     float m = std::clamp((float) w * 0.06f, D(32), D(72));
     float x = m;
     float avail = (float) w - m * 2.f;
     bool controls = !view.fullscreen && view.pin.empty();
-    // Wide windows give the right side to an iPad with AirPlay rings; narrow ones keep everything in one column.
+    // Wide windows give the right side to the logo among the leaves; narrow ones keep everything in one column.
     bool art = w >= (int) D(880) && h >= (int) D(500);
     float col_w = art ? avail * 0.56f : avail;
     float row_h = D(40);
@@ -564,7 +784,6 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
     float chip_h = D(44);
     float steps_y = row_y - D(26) - chip_h;
     float bottom = steps ? steps_y - D(34) : controls ? row_y - D(44) : (float) h - m;
-    double t = drift_allowed() ? (double) GetTickCount64() / 1000.0 : 0.0;
     name_rc_ = {};
     edit_rc_ = {};
     dark_rc_ = {};
@@ -572,20 +791,14 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
         r = {};
     }
 
-    // The logo on the right: where it sits, shared by the shadow pass and the real one.
     float ls = std::clamp((std::min)((avail - col_w) * 0.80f, (float) h * 0.56f), D(200), D(440));
     float icx = x + col_w + (avail - col_w) * 0.5f;
     float icy = (float) h * 0.44f;
     RectF logo(icx - ls * 0.5f, icy - ls * 0.5f, ls, ls);
-    // While waiting the logo floats a few pixels up and down, slowly.
-    float float_y = mood == Mood::Wait ? D(5) * (float) sin(t * 0.9) : 0.f;
 
-    // Everything set straight on the field: the name (or PIN) lockup and the iPad. It runs twice, once into the
-    // shadow mask and once for real, so the shadow always sits under exactly what is drawn.
+    // The name (or PIN) lockup, set straight on the field. It runs twice, once into the shadow mask and once for
+    // real, so the shadow always sits under exactly what is drawn.
     auto field_text = [&](Graphics &g, bool real) {
-        if (art && !real) {
-            draw_logo_image(g, RectF(logo.X, logo.Y + float_y, ls, ls)); // its own shape casts the shadow
-        }
         if (real) {
             g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
         }
@@ -654,220 +867,271 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
         }
     };
 
-    // Shadow in the field's own deep tone, dropped a few pixels: lift for the type, not a dark halo.
-    Color shade((BYTE) (f.bottom.GetR() / 3), (BYTE) (f.bottom.GetG() / 3), (BYTE) (f.bottom.GetB() / 3));
-    cast_shadow((uint32_t *) bits, w, h, shade, D(4), D(16), 0.55f, [&](Graphics &mg) { field_text(mg, false); });
-
+    // The ground, the leaves and the shadows under them and under the type: the slow part, and the same whatever
+    // the mouse is over, so it is kept and only redone when the window size, state or text changes.
+    std::wstring bkey;
     {
-        Graphics g(mem);
-        g.SetSmoothingMode(SmoothingModeAntiAlias);
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-
-        // Glass: a faint fill, a brighter top edge and a hairline border, so controls float on the field.
-        auto glass = [&](const RectF &r, float rad, int fill_a, int edge_a) {
-            fill_round(g, r, rad, Color((BYTE) fill_a, 255, 255, 255));
-            GraphicsPath p;
-            add_round_rect(p, r, rad);
-            RectF top(r.X, r.Y, r.Width, r.Height * 0.55f);
-            LinearGradientBrush sheen(top, Color(28, 255, 255, 255), Color(0, 255, 255, 255), 90.f);
-            g.SetClip(&p);
-            g.FillRectangle(&sheen, top);
-            g.ResetClip();
-            draw_round(g, r, rad, Color((BYTE) edge_a, 255, 255, 255), D(1));
-        };
-
-        // State pill, top left: a lit dot says what's happening before any word is read.
+        wchar_t head[96];
+        swprintf_s(head, L"%d|%d|%d|%d|%d|", w, h, dpi_, (int) mood, (int) view.dark);
+        bkey = head + view.name + L'\x1f' + view.pin;
+    }
+    const size_t npx = (size_t) w * (size_t) h;
+    if (bkey == base_key_ && base_.size() == npx) {
+        memcpy(bits, base_.data(), npx * 4);
+    } else {
+        fill_field(bits, w, h, f, 0.0);
+        Color shade((BYTE) (f.bottom.GetR() / 3), (BYTE) (f.bottom.GetG() / 3), (BYTE) (f.bottom.GetB() / 3));
+        cast_shadow(bits, w, h, shade, D(5), D(18), 0.6f, [&](Graphics &mg) {
+            draw_leaves(mg, w, h, view.dark, art);
+            field_text(mg, false);
+        });
         {
-            Font state_f(face_strong(), D(14), FontStyleRegular, UnitPixel);
-            std::wstring s = !view.pin.empty() ? L"Pairing" : view.status;
-            float pill_h = D(34);
-            float tw = (std::min)(width_of(g, s, state_f), avail - D(140));
-            RectF pill(x, m - D(4), D(14) + D(10) + D(10) + tw + D(16), pill_h);
-            glass(pill, pill_h * 0.5f, 34, 64);
-            Color dot = mood == Mood::Fail   ? Color(255, 255, 110, 100)
-                        : mood == Mood::Pair ? Color(255, 255, 196, 92)
-                        : mood == Mood::Live ? Color(255, 96, 230, 150)
-                                             : Color(255, 140, 200, 255);
-            float dcx = pill.X + D(14) + D(5), dcy = pill.Y + pill_h * 0.5f;
-            if (mood == Mood::Wait) {
-                // A slow breathing halo while waiting: alive, never insistent.
-                float k = 0.5f + 0.5f * (float) sin(t * 2.2);
-                float hr = D(5) + D(5) * k;
-                fill_round(g, RectF(dcx - hr, dcy - hr, hr * 2, hr * 2), hr,
-                           Color((BYTE) (70 * (1.f - k) + 20), dot.GetR(), dot.GetG(), dot.GetB()));
-            }
-            fill_round(g, RectF(dcx - D(5), dcy - D(5), D(10), D(10)), D(5), dot);
-            draw_line(g, s, state_f, dcx + D(5) + D(10), dcy + D(14) * 0.36f, tw + 2, c_label);
+            Graphics g(cache_dc_);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+            draw_leaves(g, w, h, view.dark, art);
+            // The leaves throw a second, tighter shadow of their own onto anything drawn after: none needed, the
+            // glass controls sit above them.
         }
-
-        if (art) {
-            // A soft glow under the logo that breathes while waiting, then the logo itself.
-            {
-                float k = mood == Mood::Wait ? 0.5f + 0.5f * (float) sin(t * 1.6) : 0.4f;
-                GraphicsPath glow;
-                glow.AddEllipse(icx - ls * 0.52f, icy - ls * 0.36f + float_y, ls * 1.04f, ls * 0.72f);
-                Gdiplus::PathGradientBrush pg(&glow);
-                pg.SetCenterColor(Color((BYTE) (40 + 50 * k), 60, 150, 255));
-                Color edge(0, 60, 150, 255);
-                int n = 1;
-                pg.SetSurroundColors(&edge, &n);
-                g.FillPath(&pg, &glow);
-            }
-            draw_logo_image(g, RectF(logo.X, logo.Y + float_y, ls, ls));
-
-            // Shortcuts and the PC's address under the logo, small enough to ignore until needed.
-            Font hint_f(face_text(), D(13), FontStyleRegular, UnitPixel);
-            Color faint(160, 255, 255, 255);
-            const wchar_t *keys =
-                L"Ctrl+R record   ·   Ctrl+M mic   ·   1–4 scenes   ·   F11 full screen";
-            float base = logo.Y + ls * 0.98f + D(18); // just under the picture
-            float kw = (std::min)(width_of(g, keys, hint_f), avail - col_w);
-            draw_line(g, keys, hint_f, icx - kw * 0.5f, base, avail - col_w, faint);
-            if (!view.detail.empty()) {
-                float dw = width_of(g, view.detail, hint_f);
-                draw_line(g, view.detail, hint_f, icx - dw * 0.5f, base + D(22), avail - col_w, faint);
-            }
+        GdiFlush();
+        try {
+            base_.assign(bits, bits + npx);
+            base_key_ = bkey;
+        } catch (...) {
+            base_.clear();
+            base_key_.clear();
         }
-
-        if (steps) {
-            // How to connect, as three numbered chips in the order you tap them.
-            Font chip_f(face_strong(), D(14), FontStyleRegular, UnitPixel);
-            Font num_f(face_strong(), D(12), FontStyleRegular, UnitPixel);
-            const std::wstring labels[3] = {L"Open Control Center", L"Screen Mirroring", view.name};
-            float circle = D(22);
-            float pad = D(12);
-            float gapc = D(26);
-            float lw[3], total = 0;
-            for (int i = 0; i < 3; ++i) {
-                lw[i] = width_of(g, labels[i], chip_f);
-                total += pad + circle + D(10) + lw[i] + pad * 1.4f;
-            }
-            total += gapc * 2;
-            float shrink = total > col_w ? (col_w - gapc * 2) / (total - gapc * 2) : 1.f;
-            float cx = x;
-            for (int i = 0; i < 3; ++i) {
-                float cw = (pad + circle + D(10) + lw[i] + pad * 1.4f) * shrink;
-                RectF chip(cx, steps_y, cw, chip_h);
-                glass(chip, D(14), 26, 56);
-                float ccy = steps_y + chip_h * 0.5f;
-                RectF circ(chip.X + pad, ccy - circle * 0.5f, circle, circle);
-                fill_round(g, circ, circle * 0.5f, Color(235, 255, 255, 255));
-                std::wstring n(1, (wchar_t) (L'1' + i));
-                float nw = width_of(g, n, num_f);
-                draw_line(g, n, num_f, circ.X + (circle - nw) * 0.5f, ccy + D(12) * 0.36f, circle, f.ink);
-                draw_line(g, labels[i], chip_f, circ.GetRight() + D(10), ccy + D(14) * 0.36f,
-                          chip.GetRight() - circ.GetRight() - D(10) - pad * 0.6f, c_label);
-                cx += cw;
-                if (i < 2) {
-                    chevron(g, cx + gapc * 0.5f - D(2), ccy, D(4), c_soft, D(1.6f));
-                    cx += gapc;
-                }
-            }
-        }
-
-        if (controls) {
-            const wchar_t *labels[4] = {L"Rename", L"Full Screen", L"Always on Top", L"Require PIN"};
-            bool on[4] = {false, view.fullscreen, view.always_on_top, view.require_pin};
-            Font btn_f(face_strong(), D(13), FontStyleRegular, UnitPixel);
-            float gap = D(8);
-            float split = D(20); // Rename is an action; the toggles group apart from it
-            float icon_s = D(16);
-            float icon_gap = D(8);
-            float pad = D(14);
-            float label_w[4];
-            for (int i = 0; i < 4; ++i) {
-                label_w[i] = width_of(g, labels[i], btn_f);
-            }
-            bool icons = true;
-            auto row_width = [&] {
-                float tw = gap * 2 + split;
-                for (float lw : label_w) {
-                    tw += pad * 2 + (icons ? icon_s + icon_gap : 0) + lw;
-                }
-                return tw;
-            };
-            if (row_width() > col_w) {
-                icons = false;
-                pad = D(10);
-            }
-
-            float bx = x;
-            for (int i = 0; i < 4; ++i) {
-                float bw = pad * 2 + (icons ? icon_s + icon_gap : 0) + label_w[i];
-                RectF br(bx, row_y, bw, row_h);
-                bool hot = hover == (int) UiHit::Rename + i;
-                float rad = row_h * 0.5f;
-                Color ink = c_label;
-                if (on[i]) {
-                    // On floods the whole control: readable as filled, not by hue.
-                    fill_round(g, br, rad, hot ? Color(232, 255, 255, 255) : c_label);
-                    ink = f.ink;
-                } else if (i == 0) {
-                    if (hot) {
-                        fill_round(g, br, rad, Color(36, 255, 255, 255));
-                    }
-                    draw_round(g, br, rad, Color(130, 255, 255, 255), D(1.25f));
-                } else {
-                    glass(br, rad, hot ? 64 : 34, hot ? 110 : 64);
-                }
-                float cx = br.X + pad;
-                if (icons) {
-                    RectF ib(cx, row_y + (row_h - icon_s) * 0.5f, icon_s, icon_s);
-                    float sw = D(1.6f);
-                    if (i == 0) {
-                        icon_pencil(g, ib, ink, sw);
-                    } else if (i == 1) {
-                        icon_expand(g, ib, ink, sw);
-                    } else if (i == 2) {
-                        icon_pin(g, ib, ink, sw);
-                    } else {
-                        icon_lock(g, ib, ink, sw);
-                    }
-                    cx += icon_s + icon_gap;
-                }
-                draw_line(g, labels[i], btn_f, cx, row_y + row_h * 0.5f + D(13) * 0.35f, label_w[i] + 2, ink);
-                btn_rc_[i] = {(LONG) br.X, (LONG) br.Y, (LONG) br.GetRight(), (LONG) br.GetBottom()};
-                bx += bw + (i == 0 ? split : gap);
-            }
-
-            // Dark mode: a round tile in the top-right corner, level with the state pill, flooded when on.
-            float ds = D(38);
-            RectF dr((float) w - m - ds, m - D(4) + (D(34) - ds) * 0.5f, ds, ds);
-            bool dark_hot = hover == (int) UiHit::Dark;
-            if (view.dark) {
-                fill_round(g, dr, ds * 0.5f, dark_hot ? Color(232, 255, 255, 255) : c_label);
-            } else {
-                glass(dr, ds * 0.5f, dark_hot ? 64 : 34, dark_hot ? 110 : 64);
-            }
-            icon_moon(g, RectF(dr.X + (ds - icon_s) * 0.5f, dr.Y + (ds - icon_s) * 0.5f, icon_s, icon_s),
-                      view.dark ? f.ink : c_label, D(1.6f));
-            dark_rc_ = {(LONG) dr.X, (LONG) dr.Y, (LONG) dr.GetRight(), (LONG) dr.GetBottom()};
-        }
-
-        field_text(g, true);
     }
 
-    BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, old);
-    DeleteObject(bm);
-    DeleteDC(mem);
+    Graphics g(cache_dc_);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
+
+    // Glass: a faint cream fill, a brighter top edge and a hairline border, so controls float on the field.
+    auto glass = [&](const RectF &r, float rad, int fill_a, int edge_a) {
+        fill_round(g, r, rad, Color((BYTE) fill_a, 255, 246, 228));
+        GraphicsPath p;
+        add_round_rect(p, r, rad);
+        RectF top(r.X, r.Y, r.Width, r.Height * 0.55f);
+        LinearGradientBrush sheen(top, Color(30, 255, 250, 238), Color(0, 255, 250, 238), 90.f);
+        g.SetClip(&p);
+        g.FillRectangle(&sheen, top);
+        g.ResetClip();
+        draw_round(g, r, rad, Color((BYTE) edge_a, 255, 246, 228), D(1));
+    };
+
+    // State pill, top left: a lit dot says what's happening before any word is read. The dot itself is drawn
+    // each frame (it breathes); here only its place is set.
+    {
+        Font state_f(face_strong(), D(14), FontStyleRegular, UnitPixel);
+        std::wstring s = !view.pin.empty() ? L"Pairing" : view.status;
+        float pill_h = D(34);
+        float tw = (std::min)(width_of(g, s, state_f), avail - D(140));
+        RectF pill(x, m - D(4), D(14) + D(10) + D(10) + tw + D(16), pill_h);
+        glass(pill, pill_h * 0.5f, 40, 72);
+        Color dot = mood == Mood::Fail   ? Color(255, 238, 124, 98)
+                    : mood == Mood::Pair ? Color(255, 246, 196, 116)
+                    : mood == Mood::Live ? Color(255, 128, 232, 172)
+                                         : Color(255, 190, 228, 160);
+        dot_x_ = pill.X + D(14) + D(5);
+        dot_y_ = pill.Y + pill_h * 0.5f;
+        dot_r_ = D(5);
+        dot_argb_ = dot.GetValue();
+        draw_line(g, s, state_f, dot_x_ + D(5) + D(10), dot_y_ + D(14) * 0.36f, tw + 2, c_label);
+    }
+    breathe_ = mood == Mood::Wait && drift_allowed();
+
+    show_logo_ = art;
+    float_logo_ = art && mood == Mood::Wait && drift_allowed();
+    logo_x_ = logo.X;
+    logo_y_ = logo.Y;
+    logo_s_ = ls;
+    glow_argb_ = view.dark ? Color(255, 120, 170, 120).GetValue() : Color(255, 255, 236, 196).GetValue();
+    if (art) {
+        // Shortcuts and the PC's address under the logo, small enough to ignore until needed.
+        Font hint_f(face_text(), D(13), FontStyleRegular, UnitPixel);
+        Color faint(176, 246, 236, 216);
+        const wchar_t *keys = L"Ctrl+R record   ·   Ctrl+M mic   ·   Ctrl+Alt+L laser   ·   F11 full screen";
+        float base = logo.Y + ls * 0.98f + D(18);
+        float kw = (std::min)(width_of(g, keys, hint_f), avail - col_w);
+        draw_line(g, keys, hint_f, icx - kw * 0.5f, base, avail - col_w, faint);
+        if (!view.detail.empty()) {
+            float dw = (std::min)(width_of(g, view.detail, hint_f), avail - col_w);
+            draw_line(g, view.detail, hint_f, icx - dw * 0.5f, base + D(22), avail - col_w, faint);
+        }
+    }
+
+    if (steps) {
+        // How to connect, as three numbered chips in the order you tap them.
+        Font chip_f(face_strong(), D(14), FontStyleRegular, UnitPixel);
+        Font num_f(face_strong(), D(12), FontStyleRegular, UnitPixel);
+        const std::wstring labels[3] = {L"Open Control Center", L"Screen Mirroring", view.name};
+        float circle = D(22);
+        float pad = D(12);
+        float gapc = D(26);
+        float lw[3], total = 0;
+        for (int i = 0; i < 3; ++i) {
+            lw[i] = width_of(g, labels[i], chip_f);
+            total += pad + circle + D(10) + lw[i] + pad * 1.4f;
+        }
+        total += gapc * 2;
+        float shrink = total > col_w ? (col_w - gapc * 2) / (total - gapc * 2) : 1.f;
+        float cx = x;
+        for (int i = 0; i < 3; ++i) {
+            float cw = (pad + circle + D(10) + lw[i] + pad * 1.4f) * shrink;
+            RectF chip(cx, steps_y, cw, chip_h);
+            glass(chip, D(16), 30, 60);
+            float ccy = steps_y + chip_h * 0.5f;
+            RectF circ(chip.X + pad, ccy - circle * 0.5f, circle, circle);
+            fill_round(g, circ, circle * 0.5f, Color(240, 250, 244, 232));
+            std::wstring n(1, (wchar_t) (L'1' + i));
+            float nw = width_of(g, n, num_f);
+            draw_line(g, n, num_f, circ.X + (circle - nw) * 0.5f, ccy + D(12) * 0.36f, circle, f.ink);
+            draw_line(g, labels[i], chip_f, circ.GetRight() + D(10), ccy + D(14) * 0.36f,
+                      chip.GetRight() - circ.GetRight() - D(10) - pad * 0.6f, c_label);
+            cx += cw;
+            if (i < 2) {
+                chevron(g, cx + gapc * 0.5f - D(2), ccy, D(4), c_soft, D(1.6f));
+                cx += gapc;
+            }
+        }
+    }
+
+    if (controls) {
+        // Rename | Full Screen, Always on Top, Require PIN | Laser. The laser sits apart at the end: it is for
+        // teaching, the others are about the window.
+        const int kN = 5;
+        const wchar_t *labels[kN] = {L"Rename", L"Full Screen", L"Always on Top", L"Require PIN", L"Laser"};
+        bool on[kN] = {false, view.fullscreen, view.always_on_top, view.require_pin, view.laser};
+        Font btn_f(face_strong(), D(13), FontStyleRegular, UnitPixel);
+        float gap = D(8);
+        float split = D(18);
+        float icon_s = D(16);
+        float icon_gap = D(8);
+        float label_w[kN];
+        for (int i = 0; i < kN; ++i) {
+            label_w[i] = width_of(g, labels[i], btn_f);
+        }
+        // Icons and words; just words; or, when even that is too wide, round icon buttons (the tooltips of the
+        // window still say what each does).
+        int mode = 0;
+        auto button_w = [&](int i, int md) {
+            if (md == 2) {
+                return row_h;
+            }
+            float pad = md == 0 ? D(14) : D(10);
+            return pad * 2 + (md == 0 || i == 4 ? icon_s + icon_gap : 0) + label_w[i];
+        };
+        auto row_width = [&](int md) {
+            float tw = gap * 2 + split * 2;
+            for (int i = 0; i < kN; ++i) {
+                tw += button_w(i, md);
+            }
+            return tw;
+        };
+        while (mode < 2 && row_width(mode) > col_w) {
+            ++mode;
+        }
+
+        float bx = x;
+        for (int i = 0; i < kN; ++i) {
+            float bw = button_w(i, mode);
+            RectF br(bx, row_y, bw, row_h);
+            bool hot = hover == (int) UiHit::Rename + i;
+            float rad = row_h * 0.5f;
+            Color ink = c_label;
+            if (i == 4 && on[i]) {
+                // The laser on: lit red, with a soft glow, so it is plain from across the room that it's live.
+                for (int k = 3; k >= 1; --k) {
+                    float e = D(3) * (float) k;
+                    RectF gr(br.X - e, br.Y - e, br.Width + e * 2, br.Height + e * 2);
+                    fill_round(g, gr, rad + e, Color((BYTE) (26 / k), 255, 80, 64));
+                }
+                fill_round_grad(g, br, rad, hot ? Color(255, 248, 104, 88) : Color(255, 236, 88, 70),
+                                Color(255, 196, 52, 44), 90.f);
+                ink = Color(255, 255, 248, 240);
+            } else if (on[i]) {
+                // On floods the whole control in cream: readable as filled, not by hue.
+                fill_round(g, br, rad, hot ? Color(236, 250, 244, 232) : c_label);
+                ink = f.ink;
+            } else if (i == 0) {
+                if (hot) {
+                    fill_round(g, br, rad, Color(40, 255, 246, 228));
+                }
+                draw_round(g, br, rad, Color(140, 250, 244, 232), D(1.25f));
+            } else {
+                glass(br, rad, hot ? 70 : 38, hot ? 120 : 70);
+            }
+            float pad = mode == 0 ? D(14) : D(10);
+            float cx = br.X + pad;
+            if (mode != 1 || i == 4) { // the laser keeps its icon: it should be found at a glance
+                if (mode == 2) {
+                    cx = br.X + (bw - icon_s) * 0.5f;
+                }
+                RectF ib(cx, row_y + (row_h - icon_s) * 0.5f, icon_s, icon_s);
+                float sw = D(1.6f);
+                if (i == 0) {
+                    icon_pencil(g, ib, ink, sw);
+                } else if (i == 1) {
+                    icon_expand(g, ib, ink, sw);
+                } else if (i == 2) {
+                    icon_pin(g, ib, ink, sw);
+                } else if (i == 3) {
+                    icon_lock(g, ib, ink, sw);
+                } else {
+                    icon_laser(g, ib, i == 4 && !on[i] ? Color(255, 255, 132, 112) : ink, sw);
+                }
+                cx += icon_s + icon_gap;
+            }
+            if (mode != 2) {
+                draw_line(g, labels[i], btn_f, cx, row_y + row_h * 0.5f + D(13) * 0.35f, label_w[i] + 2, ink);
+            }
+            btn_rc_[i] = {(LONG) br.X, (LONG) br.Y, (LONG) br.GetRight(), (LONG) br.GetBottom()};
+            bx += bw + (i == 0 || i == 3 ? split : gap);
+        }
+
+        // Dark mode: a round tile in the top-right corner, level with the state pill, flooded when on.
+        float ds = D(38);
+        RectF dr((float) w - m - ds, m - D(4) + (D(34) - ds) * 0.5f, ds, ds);
+        bool dark_hot = hover == (int) UiHit::Dark;
+        if (view.dark) {
+            fill_round(g, dr, ds * 0.5f, dark_hot ? Color(236, 250, 244, 232) : c_label);
+        } else {
+            glass(dr, ds * 0.5f, dark_hot ? 80 : 46, dark_hot ? 130 : 80);
+        }
+        icon_moon(g, RectF(dr.X + (ds - icon_s) * 0.5f, dr.Y + (ds - icon_s) * 0.5f, icon_s, icon_s),
+                  view.dark ? f.ink : c_label, D(1.6f));
+        dark_rc_ = {(LONG) dr.X, (LONG) dr.Y, (LONG) dr.GetRight(), (LONG) dr.GetBottom()};
+    }
+
+    field_text(g, true);
+
+    // What the animation timer repaints, each on its own (one far corner to the other would be most of the
+    // window): the dot with its halo, and the logo with its glow and float.
+    RECT all = {0, 0, w, h};
+    anim_rc_[0] = anim_rc_[1] = {};
+    if (breathe_ && dot_r_ > 0) {
+        float e = dot_r_ * 2.f + D(2);
+        RECT a = {(LONG) (dot_x_ - e), (LONG) (dot_y_ - e), (LONG) (dot_x_ + e) + 1, (LONG) (dot_y_ + e) + 1};
+        IntersectRect(&anim_rc_[0], &a, &all);
+    }
+    if (float_logo_) {
+        RECT l = {(LONG) (logo_x_ - ls * 0.04f), (LONG) (logo_y_ - D(8)), (LONG) (logo_x_ + ls * 1.04f) + 1,
+                  (LONG) (logo_y_ + ls + D(8)) + 1};
+        IntersectRect(&anim_rc_[1], &l, &all);
+    }
+    animating_ = !IsRectEmpty(&anim_rc_[0]) || !IsRectEmpty(&anim_rc_[1]);
 }
 
 UiHit ShellUi::hit_test(POINT pt) const {
     if (PtInRect(&name_rc_, pt)) {
         return UiHit::Name;
     }
-    if (PtInRect(&btn_rc_[0], pt)) {
-        return UiHit::Rename;
-    }
-    if (PtInRect(&btn_rc_[1], pt)) {
-        return UiHit::Fullscreen;
-    }
-    if (PtInRect(&btn_rc_[2], pt)) {
-        return UiHit::Topmost;
-    }
-    if (PtInRect(&btn_rc_[3], pt)) {
-        return UiHit::Pin;
+    static const UiHit order[5] = {UiHit::Rename, UiHit::Fullscreen, UiHit::Topmost, UiHit::Pin, UiHit::Laser};
+    for (int i = 0; i < 5; ++i) {
+        if (PtInRect(&btn_rc_[i], pt)) {
+            return order[i];
+        }
     }
     if (PtInRect(&dark_rc_, pt)) {
         return UiHit::Dark;

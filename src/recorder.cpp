@@ -910,12 +910,18 @@ bool Recorder::open_video_encoder(int w, int h) {
         }
         AVDictionary *opts = nullptr;
         if (strcmp(name, "h264_nvenc") == 0) {
-            av_dict_set(&opts, "preset", "p5", 0);
+            // Above 1440p the slower preset and adaptive quantisation could not keep up with 60 fps on mid-range
+            // cards (the log showed "encoder behind" and skipped frames on 4K canvases); p4 without AQ holds 4K60
+            // with little visible difference at this bitrate.
+            const bool big = (int64_t) w * h > 2560 * 1440;
+            av_dict_set(&opts, "preset", big ? "p4" : "p5", 0);
             av_dict_set(&opts, "tune", "hq", 0);
             av_dict_set(&opts, "rc", "vbr", 0);
             av_dict_set(&opts, "cq", "19", 0);
             av_dict_set(&opts, "profile", "high", 0);
-            av_dict_set(&opts, "spatial-aq", "1", 0);
+            if (!big) {
+                av_dict_set(&opts, "spatial-aq", "1", 0);
+            }
         } else if (strcmp(name, "h264_qsv") == 0) {
             av_dict_set(&opts, "preset", "medium", 0);
             av_dict_set(&opts, "profile", "high", 0);

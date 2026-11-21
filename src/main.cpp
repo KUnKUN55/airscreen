@@ -26,6 +26,9 @@
 #include <string>
 #include <vector>
 #include <cmath>
+#include <csignal>
+#include <cstdlib>
+#include <exception>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -617,6 +620,9 @@ void App::run(airscreen::Action a) {
         laser.set_style(settings_.laser_color, settings_.laser_size);
         laser.set_on(inst, !laser.on());
         panel.refresh();
+        if (hwnd && !live()) {
+            InvalidateRect(hwnd, nullptr, FALSE); // the Laser button on the home screen
+        }
         return;
     default:
         if (a >= Action::Scene1 && a <= Action::Scene9) {
@@ -937,6 +943,7 @@ void paint_idle(App *app, HDC hdc, RECT rc) {
     v.require_pin = app->settings_.require_pin;
     v.fullscreen = app->fullscreen;
     v.dark = app->settings_.dark_mode;
+    v.laser = app->laser.on();
     v.failed = app->start_failed;
     v.inset_right = 0;
     static std::wstring net = network_hint(); // adapters rarely change while the window is up
@@ -1087,6 +1094,9 @@ void apply_hit(App *app, airscreen::UiHit hit) {
     case airscreen::UiHit::Pin:
         handle_tray_cmd(app, IDM_TRAY_PIN);
         break;
+    case airscreen::UiHit::Laser:
+        app->run(airscreen::Action::Laser);
+        break;
     case airscreen::UiHit::Dark:
         app->settings_.dark_mode = !app->settings_.dark_mode;
         airscreen::save_settings(app->settings_);
@@ -1215,8 +1225,15 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             // or hidden one not at all.
             static unsigned tick = 0;
             bool front = GetForegroundWindow() == hwnd;
-            if (IsWindowVisible(hwnd) && !IsIconic(hwnd) && (front || ++tick % 4 == 0)) {
-                InvalidateRect(hwnd, nullptr, FALSE);
+            // Only the two small moving parts are repainted, each on its own, over the cached still picture; when
+            // nothing moves (mirroring, a PIN, animations turned off in Windows) nothing is redrawn at all.
+            if (app->shell.animating() && IsWindowVisible(hwnd) && !IsIconic(hwnd) && (front || ++tick % 4 == 0)) {
+                for (int i = 0; i < 2; ++i) {
+                    RECT r = app->shell.anim_rect(i);
+                    if (!IsRectEmpty(&r)) {
+                        RedrawWindow(hwnd, &r, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOCHILDREN);
+                    }
+                }
             }
         } else if (wparam == kTimerRec) {
             if (app->recording && !app->receiver.recorder().active()) {
@@ -1446,6 +1463,29 @@ LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// Failures that never reach the unhandled-exception filter: std::terminate (an exception escaping a thread),
+// abort(), a pure virtual call, and a bad argument to the C runtime. Each is turned into a real exception so the
+// filter above logs it and writes crash.dmp, instead of the app vanishing without a trace.
+[[noreturn]] void fail_fast(const char *why) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "fatal: %s", why);
+    airscreen::append_log(buf);
+    RaiseException(0xE0A1A001u, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    TerminateProcess(GetCurrentProcess(), 3);
+    for (;;) {
+    }
+}
+
+void install_fatal_handlers() {
+    std::set_terminate([] { fail_fast("std::terminate (an unhandled C++ exception)"); });
+    _set_purecall_handler([] { fail_fast("pure virtual call"); });
+    _set_invalid_parameter_handler([](const wchar_t *, const wchar_t *, const wchar_t *, unsigned, uintptr_t) {
+        fail_fast("invalid parameter passed to the C runtime");
+    });
+    signal(SIGABRT, [](int) { fail_fast("abort()"); });
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+}
+
 bool activate_existing() {
     HWND w = FindWindowW(L"AirScreenWindow", nullptr);
     if (!w) {
@@ -1489,6 +1529,7 @@ bool load_teaching(App *app) {
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
     SetUnhandledExceptionFilter(crash_filter);
+    install_fatal_handlers();
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     HANDLE instance = CreateMutexW(nullptr, TRUE, L"Local\\AirScreen.Receiver.1");

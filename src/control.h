@@ -26,7 +26,7 @@ public:
     HWND hwnd() const { return hwnd_; }
 
 private:
-    enum Style { Chip, Toggle, Danger, Plain };
+    enum Style { Chip, Toggle, Danger, Plain, Laser };
     struct Button {
         int id = 0;
         RECT rc{};

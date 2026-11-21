@@ -194,6 +194,17 @@ bool ScreenCapture::start(ID3D11Device *device, const CaptureTarget &target, boo
         } else {
             hr = interop->CreateForMonitor((HMONITOR) target.monitor, winrt::guid_of<wgc::GraphicsCaptureItem>(),
                                            winrt::put_abi(impl->item));
+            if (FAILED(hr) || !impl->item) {
+                // The handle went stale: Windows re-creates monitor handles when displays wake, are re-plugged or
+                // change mode, and the old one is then refused (E_INVALIDARG). Find the display at the same place.
+                RECT where = {target.x, target.y, target.x + (std::max)(1, target.w), target.y + (std::max)(1, target.h)};
+                HMONITOR now = MonitorFromRect(&where, MONITOR_DEFAULTTONULL);
+                if (now && now != (HMONITOR) target.monitor) {
+                    impl->item = nullptr;
+                    hr = interop->CreateForMonitor(now, winrt::guid_of<wgc::GraphicsCaptureItem>(),
+                                                   winrt::put_abi(impl->item));
+                }
+            }
         }
         if (FAILED(hr) || !impl->item) {
             return fail("Windows would not share it (" + hr_text(hr) + ")");

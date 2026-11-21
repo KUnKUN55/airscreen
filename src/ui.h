@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <string>
+#include <vector>
 
 namespace airscreen {
 
@@ -12,6 +13,7 @@ enum class UiHit {
     Fullscreen,
     Topmost,
     Pin,
+    Laser,
     Dark,
 };
 
@@ -25,6 +27,7 @@ struct UiView {
     bool require_pin = false;
     bool fullscreen = false;
     bool dark = false;
+    bool laser = false; // the laser pointer is on
     int inset_right = 0;
     bool failed = false;
 };
@@ -44,19 +47,47 @@ public:
 
     bool cursor_hand(UiHit hit) const;
 
+    // While idle only two things move (the breathing state dot and the floating logo). The rest is rendered once
+    // per size, state and hover into a cached picture, and the animation timer repaints just this rectangle.
+    bool animating() const { return animating_; }
+    RECT anim_rect(int i) const { return anim_rc_[i & 1]; }
+
 private:
     void ensure_icons();
     void destroy_icons();
+    void drop_cache();
+    bool ensure_cache(HDC hdc, int w, int h);
+    void paint_still(int w, int h, const UiView &view, int hover);
 
     HICON icon32_ = nullptr;
     HICON icon16_ = nullptr;
-    RECT screen_rc_{};
     RECT name_rc_{};
     RECT edit_rc_{};
-    RECT btn_rc_[4]{};
+    RECT btn_rc_[5]{};
     RECT dark_rc_{};
     RECT client_{};
     int dpi_ = 96;
+
+    HDC cache_dc_ = nullptr;
+    HBITMAP cache_bmp_ = nullptr;
+    HGDIOBJ cache_old_ = nullptr;
+    void *cache_bits_ = nullptr;
+    int cache_w_ = 0, cache_h_ = 0;
+    std::wstring cache_key_;
+    // The field, the leaves and every shadow: what hovering never changes, kept apart so hover redraws are cheap.
+    std::vector<unsigned> base_;
+    std::wstring base_key_;
+
+    // The moving parts, placed by the still pass.
+    bool animating_ = false;
+    RECT anim_rc_[2]{};
+    bool breathe_ = false;
+    float dot_x_ = 0, dot_y_ = 0, dot_r_ = 0;
+    unsigned dot_argb_ = 0;
+    bool show_logo_ = false;
+    bool float_logo_ = false;
+    float logo_x_ = 0, logo_y_ = 0, logo_s_ = 0;
+    unsigned glow_argb_ = 0;
 };
 
 ULONG_PTR gdiplus_startup();

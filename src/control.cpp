@@ -4,15 +4,19 @@
 #include <windowsx.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <algorithm>
 #include <sstream>
+
+#pragma comment(lib, "gdiplus.lib")
 
 namespace airscreen {
 namespace {
 
 constexpr int kScene = 100; // + scene index
 constexpr int kQuick = 300; // + index into the quick buttons
-constexpr int kRec = 400, kPause = 401, kStop = 402, kPreview = 403, kEdit = 404, kMore = 405;
+constexpr int kRec = 400, kPause = 401, kStop = 402, kPreview = 403, kEdit = 404, kMore = 405, kLaser = 406;
 constexpr UINT kTimerTick = 1;
 
 enum : UINT {
@@ -39,33 +43,84 @@ enum : UINT {
     kMenuApp = 40000,    // and up: the host's app_menu(), handled by the main window
 };
 
-const COLORREF kBg = RGB(28, 28, 32);
-const COLORREF kPlate = RGB(46, 46, 52);
-const COLORREF kPlateHot = RGB(62, 62, 70);
-const COLORREF kText = RGB(236, 236, 240);
-const COLORREF kDim = RGB(142, 142, 150);
-const COLORREF kOff = RGB(100, 100, 108);
-const COLORREF kAccent = RGB(10, 132, 255);
-const COLORREF kLive = RGB(48, 209, 88);
-const COLORREF kRecRed = RGB(255, 69, 58);
-const COLORREF kAmber = RGB(255, 159, 10);
+// Forest and cream: a warm paper ground, soft raised cream buttons, deep forest green for what is on, terracotta
+// for recording and a lit red for the laser. Calm enough to sit beside slides all lesson.
+const COLORREF kBgTop = RGB(246, 241, 232);
+const COLORREF kBgBottom = RGB(234, 226, 211);
+const COLORREF kCard = RGB(252, 249, 243);
+const COLORREF kEdge = RGB(222, 210, 190);
+const COLORREF kPlate = RGB(250, 246, 238);
+const COLORREF kPlateHot = RGB(255, 252, 246);
+const COLORREF kText = RGB(38, 52, 43);
+const COLORREF kDim = RGB(128, 114, 94);
+const COLORREF kLabel = RGB(150, 116, 82); // section headings: bark brown
+const COLORREF kOff = RGB(182, 172, 156);
+const COLORREF kAccent = RGB(46, 104, 78);
+const COLORREF kAccentHot = RGB(60, 126, 95);
+const COLORREF kOnText = RGB(250, 244, 232);
+const COLORREF kLive = RGB(64, 164, 104);
+const COLORREF kRecRed = RGB(188, 70, 48);
+const COLORREF kAmber = RGB(200, 138, 44);
+const COLORREF kLaserRed = RGB(222, 64, 52);
+
+Gdiplus::Color gc(COLORREF c, BYTE a = 255) {
+    return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
+}
+
+COLORREF shade(COLORREF c, int pct) {
+    return RGB(GetRValue(c) * pct / 100, GetGValue(c) * pct / 100, GetBValue(c) * pct / 100);
+}
+
+void round_path(Gdiplus::GraphicsPath &p, Gdiplus::RectF r, float rad) {
+    float d = (std::min)({rad * 2.f, r.Width, r.Height});
+    if (d < 1.f) {
+        p.AddRectangle(r);
+        return;
+    }
+    p.AddArc(r.X, r.Y, d, d, 180, 90);
+    p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p.CloseFigure();
+}
+
+void fill_rr(Gdiplus::Graphics &g, Gdiplus::RectF r, float rad, const Gdiplus::Brush &b) {
+    Gdiplus::GraphicsPath p;
+    round_path(p, r, rad);
+    g.FillPath(&b, &p);
+}
+
+// A soft shadow under a raised shape: a few widening, fading copies dropped a little.
+void soft_shadow(Gdiplus::Graphics &g, Gdiplus::RectF r, float rad, float unit, Gdiplus::Color tint) {
+    for (int i = 4; i >= 1; --i) {
+        float e = unit * (float) i;
+        Gdiplus::RectF s(r.X - e * 0.5f, r.Y + e * 0.45f, r.Width + e, r.Height + e * 0.6f);
+        Gdiplus::SolidBrush b(Gdiplus::Color((BYTE) (tint.GetA() / (i + 1)), tint.GetR(), tint.GetG(), tint.GetB()));
+        fill_rr(g, s, rad + e * 0.5f, b);
+    }
+}
+
+// A laser pointer: a short beam ending in a lit spot with three rays.
+void draw_laser_icon(Gdiplus::Graphics &g, Gdiplus::RectF b, Gdiplus::Color c, float w) {
+    Gdiplus::Pen p(c, w);
+    p.SetStartCap(Gdiplus::LineCapRound);
+    p.SetEndCap(Gdiplus::LineCapRound);
+    auto P = [&](float u, float v) { return Gdiplus::PointF(b.X + u * b.Width, b.Y + v * b.Height); };
+    g.DrawLine(&p, P(0.12f, 0.88f), P(0.52f, 0.48f));
+    Gdiplus::SolidBrush spot(c);
+    float r = 0.17f * b.Width;
+    Gdiplus::PointF s = P(0.68f, 0.32f);
+    g.FillEllipse(&spot, s.X - r, s.Y - r, r * 2, r * 2);
+    g.DrawLine(&p, P(0.68f, 0.02f), P(0.68f, 0.09f));
+    g.DrawLine(&p, P(0.98f, 0.32f), P(0.91f, 0.32f));
+    g.DrawLine(&p, P(0.90f, 0.10f), P(0.85f, 0.15f));
+}
 
 std::wstring clock_text(double s) {
     int t = (int) s;
     wchar_t b[32];
     swprintf_s(b, L"%02d:%02d:%02d", t / 3600, t / 60 % 60, t % 60);
     return b;
-}
-
-void fill_round(HDC dc, const RECT &r, int radius, COLORREF fill, COLORREF edge) {
-    HBRUSH b = CreateSolidBrush(fill);
-    HPEN p = CreatePen(PS_SOLID, 1, edge);
-    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    DeleteObject(b);
-    DeleteObject(p);
 }
 
 HFONT make_font(int px, int weight) {
@@ -100,13 +155,27 @@ bool ControlPanel::create(HINSTANCE inst, TeachHost *host) {
         return false;
     }
     dpi_ = (int) GetDpiForWindow(hwnd_);
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(hwnd_, 20, &dark, sizeof(dark));
+    // A light title bar in the panel's own cream (Windows 11 takes the colours; Windows 10 keeps its default).
+    BOOL dark = FALSE;
+    DwmSetWindowAttribute(hwnd_, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    COLORREF caption = kBgTop, caption_text = kText;
+    DwmSetWindowAttribute(hwnd_, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+    DwmSetWindowAttribute(hwnd_, 36 /* DWMWA_TEXT_COLOR */, &caption_text, sizeof(caption_text));
     if (saved) {
         RECT want = {s.panel_x, s.panel_y, s.panel_x + s.panel_w, s.panel_y + s.panel_h};
         RECT fit = visible_rect(want, dpi(280), dpi(120));
         SetWindowPos(hwnd_, nullptr, fit.left, fit.top, fit.right - fit.left, fit.bottom - fit.top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
+        // A size saved by an older version may be too short for this layout (the laser row, the taller status
+        // card): grow it so the last row of buttons is never cut off.
+        RECT cr;
+        GetClientRect(hwnd_, &cr);
+        HDC dc = GetDC(hwnd_);
+        layout(dc, cr.right);
+        ReleaseDC(hwnd_, dc);
+        if (cr.bottom < content_h_) {
+            fit_height();
+        }
     } else {
         // First time: the top-right corner of the main window's screen, out of the way of the content.
         MONITORINFO mi = {sizeof(mi)};
@@ -230,7 +299,8 @@ std::vector<Action> ControlPanel::quick_actions() const {
     std::string k;
     while (std::getline(ss, k, ',') && out.size() < 8) {
         Action a = action_from_key(k);
-        if (a != Action::None) {
+        // The laser has its own button next to recording; a second one among the quick buttons would only crowd.
+        if (a != Action::None && a != Action::Laser) {
             out.push_back(a);
         }
     }
@@ -280,8 +350,8 @@ void ControlPanel::layout(HDC hdc, int width) {
     const Scene &live = host_->live_scene();
     Profile &prof = host_->profile();
     int y = pad;
-    status_rc_ = {pad, y, width - pad, y + dpi(compact ? 22 : 40)};
-    y = status_rc_.bottom + dpi(compact ? 8 : 12);
+    status_rc_ = {pad, y, width - pad, y + dpi(compact ? 34 : 58)};
+    y = status_rc_.bottom + dpi(compact ? 10 : 14);
 
     HFONT font = make_font(dpi(13), FW_SEMIBOLD);
     HGDIOBJ old = SelectObject(hdc, font);
@@ -326,9 +396,9 @@ void ControlPanel::layout(HDC hdc, int width) {
     }
     const int bh = dpi(34);
     if (compact) {
-        // One row: the first quick buttons, record, and the menu.
-        int n = (int) (std::min)(quick.size(), (size_t) 4);
-        int cols = n + 2;
+        // One row: the first quick buttons, record, the laser and the menu.
+        int n = (int) (std::min)(quick.size(), (size_t) 3);
+        int cols = n + 3;
         int bw = (inner - gap * (cols - 1)) / cols;
         for (int i = 0; i < n; ++i) {
             Button b;
@@ -349,9 +419,17 @@ void ControlPanel::layout(HDC hdc, int width) {
         r.on = st.recording;
         r.enabled = st.recording || st.ipad || st.computer;
         buttons_.push_back(r);
+        Button l;
+        l.id = kLaser;
+        l.rc = {pad + (bw + gap) * (n + 1), y, pad + (bw + gap) * (n + 1) + bw, y + bh};
+        l.label = L"";
+        l.tip = st.laser ? L"Turn the laser pointer off   (Ctrl+Alt+L)" : L"Laser pointer   (Ctrl+Alt+L)";
+        l.style = Laser;
+        l.on = st.laser;
+        buttons_.push_back(l);
         Button m;
         m.id = kMore;
-        m.rc = {pad + (bw + gap) * (n + 1), y, pad + inner, y + bh};
+        m.rc = {pad + (bw + gap) * (n + 2), y, pad + inner, y + bh};
         m.label = L"⋯";
         m.tip = L"More: text, layouts, computer screen, settings";
         buttons_.push_back(m);
@@ -415,11 +493,25 @@ void ControlPanel::layout(HDC hdc, int width) {
             y += bh + dpi(14);
         }
 
-        // Recording.
-        labels_.push_back({{pad, y}, L"RECORDING"});
+        // Recording, and the laser pointer beside it: the two things reached for while actually teaching.
+        labels_.push_back({{pad, y}, L"RECORD  ·  POINT"});
         y += dpi(18);
+        const int laser_w = (inner - gap * 2) / 3;
+        const int rec_inner = inner - laser_w - gap; // what is left for the recording buttons
+        {
+            Button l;
+            l.id = kLaser;
+            l.rc = {pad + inner - laser_w, y, pad + inner, y + bh};
+            l.label = st.laser ? L"Laser on" : L"Laser";
+            l.tip = st.laser ? L"Turn the laser pointer off   (Ctrl+Alt+L)"
+                             : L"A glowing dot follows the mouse on every display, for pointing while you teach   "
+                               L"(Ctrl+Alt+L).  Colour and size: ⋯ → Laser pointer";
+            l.style = Laser;
+            l.on = st.laser;
+            buttons_.push_back(l);
+        }
         if (st.recording) {
-            int half = (inner - gap) / 2;
+            int half = (rec_inner - gap) / 2;
             Button p;
             p.id = kPause;
             p.rc = {pad, y, pad + half, y + bh};
@@ -430,7 +522,7 @@ void ControlPanel::layout(HDC hdc, int width) {
             buttons_.push_back(p);
             Button s;
             s.id = kStop;
-            s.rc = {pad + half + gap, y, pad + inner, y + bh};
+            s.rc = {pad + half + gap, y, pad + rec_inner, y + bh};
             s.label = L"■ Stop";
             s.tip = L"Stop recording and save the clip";
             s.style = Danger;
@@ -439,7 +531,7 @@ void ControlPanel::layout(HDC hdc, int width) {
         } else {
             Button r;
             r.id = kRec;
-            r.rc = {pad, y, pad + inner, y + bh};
+            r.rc = {pad, y, pad + rec_inner, y + bh};
             r.label = L"● Record";
             r.tip = st.ipad || st.computer ? L"Record what's on air to the Videos\\AirScreen folder"
                                            : L"Share the iPad or the computer screen first";
@@ -476,35 +568,188 @@ void ControlPanel::layout(HDC hdc, int width) {
 void ControlPanel::paint(HDC target) {
     RECT cr;
     GetClientRect(hwnd_, &cr);
+    if (cr.right <= 0 || cr.bottom <= 0) {
+        return;
+    }
     HDC dc = CreateCompatibleDC(target);
-    HBITMAP bmp = CreateCompatibleBitmap(target, cr.right, cr.bottom);
+    HBITMAP bmp = dc ? CreateCompatibleBitmap(target, cr.right, cr.bottom) : nullptr;
+    if (!bmp) {
+        if (dc) {
+            DeleteDC(dc);
+        }
+        return;
+    }
     HGDIOBJ old_bmp = SelectObject(dc, bmp);
-    HBRUSH bg = CreateSolidBrush(kBg);
-    FillRect(dc, &cr, bg);
-    DeleteObject(bg);
     layout(dc, cr.right);
     sync_tips();
     SetBkMode(dc, TRANSPARENT);
     const bool compact = host_->settings().panel_compact;
     TeachStatus st = host_->status();
 
-    // Status: a dot that says on air / waiting / off, what is shown, and the recording clock.
     HFONT big = make_font(dpi(compact ? 13 : 15), FW_SEMIBOLD);
     HFONT sub = make_font(dpi(12), FW_NORMAL);
-    HFONT label = make_font(dpi(10), FW_SEMIBOLD);
+    HFONT label = make_font(dpi(10), FW_BOLD);
     HFONT btn = make_font(dpi(13), FW_SEMIBOLD);
     bool on_air = st.ipad || st.computer;
     COLORREF dot = on_air ? kLive : (st.computer_wait ? kAmber : kOff);
-    int ds = dpi(10);
-    RECT dr = {status_rc_.left, status_rc_.top + dpi(compact ? 6 : 5), status_rc_.left + ds,
-               status_rc_.top + dpi(compact ? 6 : 5) + ds};
-    HBRUSH db = CreateSolidBrush(dot);
-    HGDIOBJ ob = SelectObject(dc, db), op = SelectObject(dc, GetStockObject(NULL_PEN));
-    Ellipse(dc, dr.left, dr.top, dr.right, dr.bottom);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    DeleteObject(db);
+    const int inset = dpi(compact ? 10 : 14); // text inside the status card
+    const int ds = dpi(10);
 
+    // Where each laser icon goes, worked out with the button font so icon and word centre together.
+    std::vector<Gdiplus::RectF> icons(buttons_.size());
+    std::vector<char> worded(buttons_.size(), 0);
+    {
+        HGDIOBJ of = SelectObject(dc, btn);
+        float is = (float) dpi(16);
+        for (size_t i = 0; i < buttons_.size(); ++i) {
+            const Button &b = buttons_[i];
+            if (b.style != Laser) {
+                continue;
+            }
+            SIZE sz = {};
+            if (!b.label.empty()) {
+                GetTextExtentPoint32W(dc, b.label.c_str(), (int) b.label.size(), &sz);
+            }
+            float total = is + (b.label.empty() ? 0.f : (float) dpi(7) + (float) sz.cx);
+            float bw = (float) (b.rc.right - b.rc.left);
+            if (total > bw - dpi(12)) {
+                total = is; // too narrow for the word: the icon alone
+            } else {
+                worded[i] = !b.label.empty();
+            }
+            float x0 = (float) b.rc.left + (bw - total) * 0.5f;
+            icons[i] = Gdiplus::RectF(x0, (float) (b.rc.top + b.rc.bottom) * 0.5f - is * 0.5f, is, is);
+        }
+        SelectObject(dc, of);
+    }
+
+    {
+        Gdiplus::Graphics g(dc);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        Gdiplus::RectF all(0, 0, (float) cr.right, (float) cr.bottom);
+        Gdiplus::LinearGradientBrush ground(all, gc(kBgTop), gc(kBgBottom), 90.f);
+        g.FillRectangle(&ground, all);
+        // A faint sprig in the top-right corner of the paper, under everything.
+        {
+            Gdiplus::Matrix m0;
+            g.GetTransform(&m0);
+            float L = (float) dpi(compact ? 46 : 74);
+            const float angles[3] = {150.f, 122.f, 176.f};
+            const float lens[3] = {1.f, 0.78f, 0.7f};
+            for (int i = 0; i < 3; ++i) {
+                g.SetTransform(&m0);
+                g.TranslateTransform((float) cr.right + (float) dpi(6), (float) dpi(-4) + (float) i * dpi(8));
+                g.RotateTransform(angles[i]);
+                float len = L * lens[i], hw = len * 0.22f;
+                Gdiplus::GraphicsPath leaf;
+                leaf.AddBezier(Gdiplus::PointF(0, 0), Gdiplus::PointF(len * 0.22f, -hw * 1.25f),
+                               Gdiplus::PointF(len * 0.7f, -hw), Gdiplus::PointF(len, 0));
+                leaf.AddBezier(Gdiplus::PointF(len, 0), Gdiplus::PointF(len * 0.7f, hw),
+                               Gdiplus::PointF(len * 0.22f, hw * 1.25f), Gdiplus::PointF(0, 0));
+                Gdiplus::SolidBrush lb(i == 1 ? Gdiplus::Color(46, 176, 132, 86) : Gdiplus::Color(40, 76, 132, 98));
+                g.FillPath(&lb, &leaf);
+            }
+            g.SetTransform(&m0);
+        }
+
+        // The status card.
+        Gdiplus::RectF card((float) status_rc_.left, (float) status_rc_.top,
+                            (float) (status_rc_.right - status_rc_.left), (float) (status_rc_.bottom - status_rc_.top));
+        float card_r = (float) dpi(14);
+        soft_shadow(g, card, card_r, (float) dpi(2), Gdiplus::Color(40, 92, 70, 44));
+        Gdiplus::SolidBrush card_b(gc(kCard));
+        fill_rr(g, card, card_r, card_b);
+        {
+            Gdiplus::GraphicsPath p;
+            round_path(p, card, card_r);
+            Gdiplus::Pen edge(gc(kEdge, 160), 1.f);
+            g.DrawPath(&edge, &p);
+        }
+        // A thin band down the card's left edge in the state's colour.
+        {
+            Gdiplus::GraphicsPath clip;
+            round_path(clip, card, card_r);
+            g.SetClip(&clip);
+            Gdiplus::SolidBrush band(gc(st.recording ? (st.paused ? kAmber : kRecRed) : dot));
+            g.FillRectangle(&band, card.X, card.Y, (float) dpi(4), card.Height);
+            g.ResetClip();
+        }
+        // The state dot, with a halo when on air.
+        float dcx = (float) (status_rc_.left + inset) + ds * 0.5f;
+        float dcy = (float) (status_rc_.top + dpi(compact ? 17 : 19));
+        if (on_air) {
+            Gdiplus::SolidBrush halo(gc(dot, 60));
+            g.FillEllipse(&halo, dcx - ds, dcy - ds, (float) ds * 2, (float) ds * 2);
+        }
+        Gdiplus::SolidBrush dot_b(gc(dot));
+        g.FillEllipse(&dot_b, dcx - ds * 0.5f, dcy - ds * 0.5f, (float) ds, (float) ds);
+
+        for (size_t i = 0; i < buttons_.size(); ++i) {
+            const Button &b = buttons_[i];
+            bool hot = (int) i == hot_ && b.enabled;
+            bool down = hot && (int) i == pressed_;
+            Gdiplus::RectF r((float) b.rc.left, (float) b.rc.top, (float) (b.rc.right - b.rc.left),
+                             (float) (b.rc.bottom - b.rc.top));
+            float rad = b.style == Chip ? r.Height * 0.5f : (float) dpi(11);
+            COLORREF top = hot ? kPlateHot : kPlate, bottom = shade(top, 96), edge = kEdge;
+            bool raised = b.enabled;
+            if ((b.style == Chip || b.style == Toggle) && b.on) {
+                top = hot ? kAccentHot : RGB(62, 124, 94);
+                bottom = shade(kAccent, 90);
+                edge = shade(kAccent, 85);
+            } else if (b.style == Danger && b.enabled && b.on) {
+                top = hot ? RGB(214, 96, 70) : RGB(204, 84, 60);
+                bottom = shade(kRecRed, 90);
+                edge = shade(kRecRed, 85);
+            } else if (b.style == Laser && b.on) {
+                // Lit: a red glow round the button, so it's plain at a glance that the pointer is live.
+                for (int k = 3; k >= 1; --k) {
+                    float e = (float) dpi(3) * (float) k;
+                    Gdiplus::SolidBrush gb(Gdiplus::Color((BYTE) (34 / k), 236, 70, 56));
+                    fill_rr(g, Gdiplus::RectF(r.X - e, r.Y - e, r.Width + e * 2, r.Height + e * 2), rad + e, gb);
+                }
+                top = hot ? RGB(246, 98, 82) : RGB(236, 84, 68);
+                bottom = RGB(192, 48, 40);
+                edge = RGB(176, 44, 36);
+            } else if (!b.enabled) {
+                top = bottom = RGB(240, 234, 222);
+                raised = false;
+            }
+            if (down) {
+                top = shade(top, 92);
+                bottom = shade(bottom, 92);
+            }
+            if (raised && !down) {
+                soft_shadow(g, r, rad, (float) dpi(1), Gdiplus::Color(hot ? 54 : 40, 92, 70, 44));
+                // A light lip on the top edge: the cream neumorphic lift.
+                Gdiplus::SolidBrush lip(Gdiplus::Color(200, 255, 255, 255));
+                fill_rr(g, Gdiplus::RectF(r.X, r.Y - 1.f, r.Width, r.Height), rad, lip);
+            }
+            Gdiplus::LinearGradientBrush fill(Gdiplus::RectF(r.X, r.Y - 1, r.Width, r.Height + 2), gc(top), gc(bottom),
+                                              90.f);
+            fill_rr(g, r, rad, fill);
+            {
+                Gdiplus::GraphicsPath p;
+                round_path(p, r, rad);
+                Gdiplus::Pen pen(gc(edge, b.enabled ? 200 : 120), 1.f);
+                g.DrawPath(&pen, &p);
+            }
+            if ((int) i == focus_ && keyboard_ && GetFocus() == hwnd_) {
+                Gdiplus::RectF f(r.X - dpi(3), r.Y - dpi(3), r.Width + dpi(6), r.Height + dpi(6));
+                Gdiplus::GraphicsPath p;
+                round_path(p, f, rad + dpi(3));
+                Gdiplus::Pen ring(gc(kAccent), (float) dpi(2));
+                g.DrawPath(&ring, &p);
+            }
+            if (b.style == Laser) {
+                draw_laser_icon(g, icons[i], b.on ? Gdiplus::Color(255, 255, 248, 240) : gc(kLaserRed),
+                                (float) dpi(2) * 0.85f);
+            }
+        }
+    }
+
+    // Text, with ClearType, over the shapes.
     std::wstring head;
     if (on_air) {
         head = L"On air  ·  ";
@@ -512,12 +757,15 @@ void ControlPanel::paint(HDC target) {
     } else {
         head = st.computer_wait ? L"Starting the computer screen…" : L"Not sharing yet";
     }
+    if (st.laser) {
+        head += L"  ·  laser";
+    }
     std::wstring rec;
     if (st.recording) {
         rec = (st.paused ? L"❚❚ PAUSED  " : L"● REC  ") + clock_text(st.rec_seconds);
     }
-    RECT hr = status_rc_;
-    hr.left += ds + dpi(8);
+    RECT hr = {status_rc_.left + inset + ds + dpi(10), status_rc_.top + dpi(compact ? 8 : 9),
+               status_rc_.right - inset, status_rc_.bottom};
     HGDIOBJ of = SelectObject(dc, big);
     if (!rec.empty()) {
         SetTextColor(dc, st.paused ? kAmber : kRecRed);
@@ -545,53 +793,41 @@ void ControlPanel::paint(HDC target) {
         } else {
             detail = L"Mirror from the iPad, or press Computer… to share this PC";
         }
-        RECT r2 = {status_rc_.left + ds + dpi(8), status_rc_.top + dpi(21), status_rc_.right, status_rc_.bottom};
+        RECT r2 = {hr.left, status_rc_.top + dpi(31), status_rc_.right - inset, status_rc_.bottom};
         SetTextColor(dc, dc_col);
         DrawTextW(dc, detail.c_str(), -1, &r2, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
     }
 
     SelectObject(dc, label);
-    SetTextColor(dc, kDim);
+    SetTextColor(dc, kLabel);
     for (auto &l : labels_) {
-        TextOutW(dc, l.first.x, l.first.y, l.second.c_str(), (int) l.second.size());
+        TextOutW(dc, l.first.x + dpi(2), l.first.y, l.second.c_str(), (int) l.second.size());
     }
 
     SelectObject(dc, btn);
     for (size_t i = 0; i < buttons_.size(); ++i) {
         const Button &b = buttons_[i];
-        bool hot = (int) i == hot_ && b.enabled;
-        bool down = hot && (int) i == pressed_;
-        COLORREF fill = hot ? kPlateHot : kPlate, text = b.enabled ? kText : kOff, edge = fill;
-        if (b.style == Chip && b.on) {
-            fill = edge = RGB(245, 245, 247);
-            text = RGB(24, 24, 28);
-        } else if (b.style == Toggle && b.on) {
-            fill = edge = hot ? RGB(40, 150, 255) : kAccent;
-            text = RGB(255, 255, 255);
+        if (b.label.empty()) {
+            continue;
+        }
+        COLORREF text = b.enabled ? kText : kOff;
+        if ((b.style == Chip || b.style == Toggle) && b.on) {
+            text = kOnText;
         } else if (b.style == Danger && b.enabled) {
-            if (b.on) {
-                fill = edge = hot ? RGB(255, 99, 88) : kRecRed;
-                text = RGB(255, 255, 255);
-            } else {
-                text = kRecRed;
-            }
-        }
-        if (down) {
-            fill = RGB(GetRValue(fill) * 85 / 100, GetGValue(fill) * 85 / 100, GetBValue(fill) * 85 / 100);
-        }
-        int radius = b.style == Chip ? b.rc.bottom - b.rc.top : dpi(10);
-        fill_round(dc, b.rc, radius, fill, edge);
-        if ((int) i == focus_ && keyboard_ && GetFocus() == hwnd_) {
-            RECT f = b.rc;
-            InflateRect(&f, dpi(2), dpi(2));
-            HPEN fp = CreatePen(PS_SOLID, dpi(2), kAccent);
-            HGDIOBJ p0 = SelectObject(dc, fp), b0 = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            RoundRect(dc, f.left, f.top, f.right, f.bottom, radius + dpi(4), radius + dpi(4));
-            SelectObject(dc, p0);
-            SelectObject(dc, b0);
-            DeleteObject(fp);
+            text = b.on ? RGB(255, 248, 240) : kRecRed;
+        } else if (b.style == Laser) {
+            text = b.on ? RGB(255, 248, 240) : kLaserRed;
         }
         RECT tr = b.rc;
+        if (b.style == Laser) {
+            if (!worded[i]) {
+                continue;
+            }
+            tr.left = (LONG) (icons[i].X + icons[i].Width) + dpi(7);
+            SetTextColor(dc, text);
+            DrawTextW(dc, b.label.c_str(), -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            continue;
+        }
         InflateRect(&tr, -dpi(6), 0);
         SetTextColor(dc, text);
         DrawTextW(dc, b.label.c_str(), -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
@@ -664,6 +900,8 @@ void ControlPanel::click(int id) {
         host_->open_editor(false);
     } else if (id == kMore) {
         more_menu();
+    } else if (id == kLaser) {
+        host_->run(Action::Laser);
     }
     refresh();
 }
