@@ -205,6 +205,10 @@ Settings load_settings() {
         } else if (key == "LaserSize") {
             int v = atoi(val.c_str());
             s.laser_size = v < 0 || v > 2 ? 1 : v;
+        } else if (key == "CheckUpdates") {
+            s.check_updates = (val == "1" || val == "true");
+        } else if (key == "UpdateSeen") {
+            s.update_seen = val;
         }
     }
     return s;
@@ -255,6 +259,8 @@ void save_settings(const Settings &s) {
     out << "HotkeyMap=" << s.hotkey_map << "\n";
     out << "LaserColor=" << s.laser_color << "\n";
     out << "LaserSize=" << s.laser_size << "\n";
+    out << "CheckUpdates=" << (s.check_updates ? 1 : 0) << "\n";
+    out << "UpdateSeen=" << s.update_seen << "\n";
 }
 
 std::string find_mac_address() {

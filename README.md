@@ -29,6 +29,7 @@ AirScreen turns a Windows PC into a wireless AirPlay receiver. Your iPhone lists
 - Light and dark idle screen
 - Closing the window quits AirScreen; settings are also in the tray icon menu
 - Optional Start with Windows: waits in the system tray, ready to mirror to
+- Tells you when a new version is out (a notification and an Update button; turn it off under Settings → Check for updates). It only asks GitHub for the latest release number and never installs anything by itself
 
 ## Requirements
 

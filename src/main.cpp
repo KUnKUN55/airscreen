@@ -6,6 +6,7 @@
 #include "editor.h"
 #include "teach.h"
 #include "laser.h"
+#include "update.h"
 #include "app/resource.h"
 #include "raop.h"
 
@@ -29,6 +30,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "dwmapi.lib")
@@ -40,6 +42,9 @@ namespace {
 
 constexpr UINT WM_AIR_EVENT = WM_APP + 1;
 constexpr UINT WM_TRAY = WM_APP + 2;
+constexpr UINT WM_AIR_UPDATE = WM_APP + 3; // lParam: a new std::wstring, the version, a newline, the release page
+constexpr UINT IDM_UPDATE_GET = 40080;
+constexpr UINT IDM_UPDATE_AUTO = 40081;
 constexpr UINT kTrayId = 1;
 constexpr UINT kTimerDisconnect = 2;
 constexpr UINT kTimerDrift = 3;
@@ -48,6 +53,9 @@ constexpr UINT kTimerPin = 5;
 constexpr UINT kTimerSave = 6;
 constexpr UINT kTimerAdvertise = 7; // checks that the iPhone can still find this PC
 constexpr UINT kAdvertiseMs = 5000;
+constexpr UINT kTimerUpdate = 8;
+constexpr UINT kUpdateFirstMs = 15000;           // after start, once the receiver is settled
+constexpr UINT kUpdateEveryMs = 12 * 3600 * 1000; // then twice a day, for a PC that is never restarted
 constexpr UINT kPinMs = 90000; // a PIN nobody typed in this long is stale
 constexpr UINT kDisconnectMs = 400;
 constexpr UINT kSaveMs = 800; // edits are saved this long after the last one
@@ -71,6 +79,9 @@ struct App : airscreen::TeachHost {
     bool running = true;
     bool mirroring = false; // the iPad's picture is showing
     bool start_failed = false;
+    std::wstring update_version; // a newer release ("1.4.0"), once the update check found one
+    std::wstring update_url;     // its release page
+    bool balloon_update = false; // the last notification shown is the update one (a click opens its page)
     int hover = 0;
     LONG windowed_style = 0;
     LONG windowed_ex = 0;
@@ -212,6 +223,7 @@ std::wstring recordings_dir() {
 }
 
 void tray_balloon(App *app, const std::wstring &title, const std::wstring &text) {
+    app->balloon_update = false;
     NOTIFYICONDATAW n = app->nid;
     n.uFlags = NIF_INFO;
     n.dwInfoFlags = NIIF_INFO;
@@ -866,6 +878,24 @@ void append_app_items(App *app, HMENU m) {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_TRAY_FIREWALL, L"Allow through firewall");
     AppendMenuW(m, MF_STRING, IDM_TRAY_LOG, L"Open log file");
+    AppendMenuW(m, MF_STRING | (app->settings_.check_updates ? MF_CHECKED : 0), IDM_UPDATE_AUTO,
+                L"Check for updates");
+    if (!app->update_version.empty()) {
+        std::wstring get = L"Download AirScreen " + app->update_version + L"…";
+        AppendMenuW(m, MF_STRING, IDM_UPDATE_GET, get.c_str());
+    }
+}
+
+// Opens the release page of the newer version (only ever this project's, as update.cpp checks).
+void open_update_page(App *app) {
+    std::wstring url = app->update_url.empty() ? std::wstring(airscreen::kReleasesUrl) : app->update_url;
+    ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+void check_updates_now(App *app) {
+    if (app->settings_.check_updates) {
+        airscreen::check_for_update_async(app->hwnd, WM_AIR_UPDATE, AIRSCREEN_VERSION);
+    }
 }
 
 HMENU App::app_menu() {
@@ -946,6 +976,7 @@ void paint_idle(App *app, HDC hdc, RECT rc) {
     v.fullscreen = app->fullscreen;
     v.dark = app->settings_.dark_mode;
     v.laser = app->laser.on();
+    v.update = app->update_version;
     v.failed = app->start_failed;
     v.inset_right = 0;
     static std::wstring net = network_hint(); // adapters rarely change while the window is up
@@ -1045,6 +1076,19 @@ void handle_tray_cmd(App *app, UINT id) {
             MessageBoxW(app->hwnd, L"Firewall rule added for AirScreen.", L"AirScreen", MB_OK);
         }
         break;
+    case IDM_UPDATE_GET:
+        open_update_page(app);
+        break;
+    case IDM_UPDATE_AUTO:
+        app->settings_.check_updates = !app->settings_.check_updates;
+        airscreen::save_settings(app->settings_);
+        if (app->settings_.check_updates) {
+            check_updates_now(app);
+        } else {
+            app->update_version.clear(); // stop offering it, as asked
+            InvalidateRect(app->hwnd, nullptr, FALSE);
+        }
+        break;
     case IDM_TRAY_LOG: {
         auto p = app->utf16(airscreen::log_path());
         ShellExecuteW(nullptr, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1098,6 +1142,9 @@ void apply_hit(App *app, airscreen::UiHit hit) {
         break;
     case airscreen::UiHit::Laser:
         app->run(airscreen::Action::Laser);
+        break;
+    case airscreen::UiHit::Update:
+        open_update_page(app);
         break;
     case airscreen::UiHit::Dark:
         app->settings_.dark_mode = !app->settings_.dark_mode;
@@ -1246,6 +1293,9 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
             }
         } else if (wparam == kTimerSave) {
             save_now(app);
+        } else if (wparam == kTimerUpdate) {
+            check_updates_now(app);
+            SetTimer(hwnd, kTimerUpdate, kUpdateEveryMs, nullptr);
         } else if (wparam == kTimerAdvertise) {
             app->receiver.keep_advertising();
             SetTimer(hwnd, kTimerAdvertise, kAdvertiseMs, nullptr);
@@ -1377,6 +1427,28 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         app->panel.refresh();
         return 0;
     }
+    case WM_AIR_UPDATE: {
+        std::unique_ptr<std::wstring> payload((std::wstring *) lparam);
+        if (!app || !payload || !app->settings_.check_updates) {
+            return 0;
+        }
+        size_t nl = payload->find(L'\n');
+        std::wstring version = payload->substr(0, nl);
+        app->update_url = nl == std::wstring::npos ? std::wstring() : payload->substr(nl + 1);
+        app->update_version = version;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        // Each new version is announced once with a notification; after that it waits quietly on the home screen
+        // and in the menu.
+        std::string seen = app->utf8(version);
+        if (app->settings_.update_seen != seen) {
+            app->settings_.update_seen = seen;
+            airscreen::save_settings(app->settings_);
+            tray_balloon(app, L"AirScreen " + version + L" is available",
+                         L"Click to open the download page. Your settings and scenes are kept when you install it.");
+            app->balloon_update = true;
+        }
+        return 0;
+    }
     case WM_POWERBROADCAST:
         if (app && wparam == PBT_APMRESUMEAUTOMATIC) {
             // Back from sleep: the network comes up with the PC, often on a new address. Check again soon
@@ -1385,6 +1457,12 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         }
         return TRUE;
     case WM_TRAY:
+        if (LOWORD(lparam) == NIN_BALLOONUSERCLICK) {
+            if (app && app->balloon_update) {
+                open_update_page(app);
+            }
+            return 0;
+        }
         if (LOWORD(lparam) == WM_RBUTTONUP || LOWORD(lparam) == WM_CONTEXTMENU) {
             show_tray_menu(app);
         } else if (LOWORD(lparam) == WM_LBUTTONDBLCLK || LOWORD(lparam) == WM_LBUTTONUP) {
@@ -1559,7 +1637,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     (void) hr;
     airscreen::rotate_log();
-    airscreen::append_log("AirScreen starting");
+    airscreen::append_log("AirScreen " AIRSCREEN_VERSION " starting");
     g_taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     bool start_in_tray = wcsstr(cmdline, L"--tray") != nullptr;
     bool teach = wcsstr(cmdline, L"--teach") != nullptr;
@@ -1680,6 +1758,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdline, int show) {
         // The advertisement can stop on its own (a socket error, a new address after the network changes or the
         // PC sleeps); without it the iPhone no longer lists this PC although everything else is running.
         SetTimer(app.hwnd, kTimerAdvertise, kAdvertiseMs, nullptr);
+        SetTimer(app.hwnd, kTimerUpdate, kUpdateFirstMs, nullptr);
         apply_video_fill(&app);
         apply_mic(&app);
         auto &video = app.receiver.video();

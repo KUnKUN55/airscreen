@@ -684,7 +684,7 @@ void ShellUi::paint(HWND hwnd, HDC hdc, RECT client, const UiView &view, int hov
     swprintf_s(head, L"%d|%d|%d|%d|%d%d%d%d%d%d%d|", w, h, dpi_, hover, (int) view.connected,
                (int) view.always_on_top, (int) view.require_pin, (int) view.fullscreen, (int) view.dark,
                (int) view.laser, (int) view.failed);
-    std::wstring key = head + view.name + L'\x1f' + view.status + L'\x1f' + view.pin + L'\x1f' + view.detail;
+    std::wstring key = head + view.name + L'\x1f' + view.status + L'\x1f' + view.pin + L'\x1f' + view.detail + L'' + view.update;
     if (key != cache_key_) {
         paint_still(w, h, view, hover);
         GdiFlush();
@@ -787,6 +787,7 @@ void ShellUi::paint_still(int w, int h, const UiView &view, int hover) {
     name_rc_ = {};
     edit_rc_ = {};
     dark_rc_ = {};
+    update_rc_ = {};
     for (auto &r : btn_rc_) {
         r = {};
     }
@@ -1102,6 +1103,30 @@ void ShellUi::paint_still(int w, int h, const UiView &view, int hover) {
         icon_moon(g, RectF(dr.X + (ds - icon_s) * 0.5f, dr.Y + (ds - icon_s) * 0.5f, icon_s, icon_s),
                   view.dark ? f.ink : c_label, D(1.6f));
         dark_rc_ = {(LONG) dr.X, (LONG) dr.Y, (LONG) dr.GetRight(), (LONG) dr.GetBottom()};
+
+        // A newer version: a cream pill beside the dark-mode tile that opens its release page.
+        if (!view.update.empty()) {
+            Font up_f(face_strong(), D(13), FontStyleRegular, UnitPixel);
+            std::wstring text = L"Update to " + view.update;
+            float tw = width_of(g, text, up_f);
+            float uh = D(34);
+            float uw = D(14) + D(14) + D(8) + tw + D(16);
+            RectF ur(dr.X - D(10) - uw, m - D(4), uw, uh);
+            if (ur.X > x + D(260)) { // never over the state pill
+                bool hot = hover == (int) UiHit::Update;
+                fill_round(g, ur, uh * 0.5f, hot ? Color(255, 255, 252, 242) : c_label);
+                // An up arrow in a circle, in the field's ink.
+                float ac = ur.X + D(14) + D(7), am = ur.Y + uh * 0.5f;
+                Pen ap(f.ink, D(1.7f));
+                round_pen(ap);
+                g.DrawEllipse(&ap, ac - D(7), am - D(7), D(14), D(14));
+                g.DrawLine(&ap, ac, am + D(3.5f), ac, am - D(3.5f));
+                g.DrawLine(&ap, ac - D(3), am - D(0.5f), ac, am - D(3.5f));
+                g.DrawLine(&ap, ac + D(3), am - D(0.5f), ac, am - D(3.5f));
+                draw_line(g, text, up_f, ac + D(7) + D(8), am + D(13) * 0.36f, tw + 2, f.ink);
+                update_rc_ = {(LONG) ur.X, (LONG) ur.Y, (LONG) ur.GetRight(), (LONG) ur.GetBottom()};
+            }
+        }
     }
 
     field_text(g, true);
@@ -1135,6 +1160,9 @@ UiHit ShellUi::hit_test(POINT pt) const {
     }
     if (PtInRect(&dark_rc_, pt)) {
         return UiHit::Dark;
+    }
+    if (PtInRect(&update_rc_, pt)) {
+        return UiHit::Update;
     }
     return UiHit::None;
 }

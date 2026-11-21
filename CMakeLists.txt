@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(AirScreen VERSION 1.0.0 LANGUAGES C CXX)
+project(AirScreen VERSION 1.3.1 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -140,11 +140,19 @@ add_executable(AirScreen WIN32
     src/laser.cpp
     src/settings.cpp
     src/ui.cpp
+    src/update.cpp
     src/openssl_applink.c
     src/app/airscreen.rc
 )
 target_include_directories(AirScreen PRIVATE src src/app "${UXPLAY_DIR}/lib" "${COMPAT_DIR}")
-target_compile_definitions(AirScreen PRIVATE AIRSCREEN_VERSION="${PROJECT_VERSION}" UNICODE _UNICODE)
+# Release builds pass the tag (-DAIRSCREEN_VERSION_OVERRIDE=1.3.0) so the app knows exactly which version it is,
+# which the update check compares against the newest release.
+set(AIRSCREEN_APP_VERSION "${PROJECT_VERSION}")
+if(AIRSCREEN_VERSION_OVERRIDE)
+    set(AIRSCREEN_APP_VERSION "${AIRSCREEN_VERSION_OVERRIDE}")
+endif()
+message(STATUS "AirScreen version ${AIRSCREEN_APP_VERSION}")
+target_compile_definitions(AirScreen PRIVATE AIRSCREEN_VERSION="${AIRSCREEN_APP_VERSION}" UNICODE _UNICODE)
 target_link_libraries(AirScreen PRIVATE
     airplay
     FFmpeg::FFmpeg

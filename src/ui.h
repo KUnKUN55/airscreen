@@ -15,6 +15,7 @@ enum class UiHit {
     Pin,
     Laser,
     Dark,
+    Update,
 };
 
 struct UiView {
@@ -28,6 +29,7 @@ struct UiView {
     bool fullscreen = false;
     bool dark = false;
     bool laser = false; // the laser pointer is on
+    std::wstring update; // a newer version to offer ("1.4.0"), or empty
     int inset_right = 0;
     bool failed = false;
 };
@@ -65,6 +67,7 @@ private:
     RECT edit_rc_{};
     RECT btn_rc_[5]{};
     RECT dark_rc_{};
+    RECT update_rc_{};
     RECT client_{};
     int dpi_ = 96;
 

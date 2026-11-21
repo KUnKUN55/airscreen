@@ -34,6 +34,10 @@ $args = @("-S", $root, "-B", "$root\build", "-A", "x64")
 if ($openssl) {
     $args += "-DOPENSSL_ROOT_DIR=$openssl"
 }
+# Release builds set AIRSCREEN_VERSION from the tag, so the app reports (and update-checks against) that version.
+if ($env:AIRSCREEN_VERSION) {
+    $args += "-DAIRSCREEN_VERSION_OVERRIDE=$env:AIRSCREEN_VERSION"
+}
 
 Write-Host "Configuring: $cmake $($args -join ' ')"
 & $cmake @args

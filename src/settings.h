@@ -51,6 +51,8 @@ struct Settings {
     std::string hotkey_map;        // "action:mods:vk,..."; empty = the defaults
     int laser_color = 0;           // laser pointer: 0 red, 1 green, 2 blue, 3 yellow
     int laser_size = 1;            // 0 small, 1 medium, 2 large
+    bool check_updates = true;     // ask GitHub now and then whether a newer AirScreen is out
+    std::string update_seen;       // the newest version already announced, so each one is announced once
 };
 
 std::wstring app_data_dir();
